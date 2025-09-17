@@ -182,8 +182,8 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             {
               role: 'user',
               content: isSummary
-                ? `Give me a 1-2 sentence market summary for these pools: ${JSON.stringify(items)}`
-                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words"}. Pools: ${JSON.stringify(items)}`,
+                ? `Give me a 1-2 sentence market summary and price direction for these pools: ${JSON.stringify(items)}`
+                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
             },
           ],
         }
@@ -195,8 +195,8 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             {
               role: 'system',
               content: isSummary
-                ? 'You are a crypto market analyst. Summarize market in 1-2 sentences.'
-                : 'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score,risk,tags,reason}.',
+                ? 'You are a crypto market analyst. Summarize market and give a price trend outlook.'
+                : 'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score,risk,tags,reason,prediction}.',
             },
             { role: 'user', content: JSON.stringify(items) },
           ],
@@ -252,6 +252,7 @@ async function getAIScores(items) {
       risk: openai.value?.[addr]?.risk || claude.value?.[addr]?.risk || 'med',
       tags: openai.value?.[addr]?.tags || claude.value?.[addr]?.tags || [],
       reason: openai.value?.[addr]?.reason || claude.value?.[addr]?.reason || '',
+      prediction: openai.value?.[addr]?.prediction || claude.value?.[addr]?.prediction || '',
       disagree: Math.max(...scores) - Math.min(...scores) > 30,
     };
   }
@@ -293,8 +294,9 @@ function formatTrending(rows, aiMap, summary) {
     const a = r.pool.attributes;
     const f = r.feat;
     const ai = aiMap[f.address] || {};
-    const tagsLine = ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : ``;
-    const reasonLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : '';
+    const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '⚠️' : '';
+    const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
+    const predictionLine = ai.prediction ? `${icon} <b>AI Prediction:</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
     const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
     const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
     let pressure = '';
@@ -304,7 +306,7 @@ function formatTrending(rows, aiMap, summary) {
       ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
       : '';
     lines.push(
-      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${tagsLine}${reasonLine}` +
+      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
         `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
         `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
           a.price_change_percentage?.h24 || 0
@@ -371,6 +373,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v4 running...');
+console.log('✅ AI-Powered BESC Trending Bot v6 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
