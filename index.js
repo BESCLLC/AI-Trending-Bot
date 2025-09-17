@@ -166,7 +166,7 @@ function buildFeatures(p) {
 function extractJsonString(text) {
   if (!text) return '{}';
   const match = text.match(/\{[\s\S]*\}/);
-  return match ? match[0] : '{}';
+  return match ? match[0].trim() : '{}';
 }
 
 async function aiScores(model, endpoint, key, items, isSummary = false) {
@@ -181,7 +181,7 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
               role: 'user',
               content: isSummary
                 ? `Give me a 1-2 sentence market summary and price direction for these pools: ${JSON.stringify(items)}`
-                : `Return ONLY valid JSON, no intro text, no commentary. Strictly output: {"address": {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"<15 words","prediction":"bullish|bearish|sideways"}} for each pool.`,
+                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
             },
           ],
         }
@@ -220,10 +220,16 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
     if (isClaude && !isSummary) raw = extractJsonString(raw);
 
     try {
-      return isSummary ? raw : JSON.parse(raw || '{}');
+      return isSummary ? raw.trim() : JSON.parse(raw || '{}');
     } catch (err) {
       console.error(`[AI/${model}] JSON parse fail:`, err.message, 'RAW:', raw);
-      return isSummary ? '' : {};
+      try {
+        const safe = raw.replace(/^[^{]+/, '').replace(/[^}]+$/, '');
+        return JSON.parse(safe);
+      } catch (e2) {
+        console.error(`[AI/${model}] Fallback also failed`);
+        return isSummary ? '' : {};
+      }
     }
   } catch (e) {
     console.error(`[AI/${model}] fail:`, e.message);
@@ -376,6 +382,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v6 (Hardened) running...');
+console.log('✅ AI-Powered BESC Trending Bot v6 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
