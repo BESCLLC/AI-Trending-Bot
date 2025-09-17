@@ -29,7 +29,7 @@ const {
   AI_TIMEOUT_MS = '5000',
 
   CLAUDE_API_KEY,
-  CLAUDE_MODEL = 'claude-3-haiku-20240307',
+  CLAUDE_MODEL = 'claude-sonnet-4-20250514',
   GROQ_API_KEY,
   GROQ_MODEL = 'llama-3.1-70b-versatile',
 
@@ -137,46 +137,70 @@ function buildFeatures(p) {
   };
 }
 
-// ---------- AI SCORING ----------
+// ---------- AI SCORING (Claude + OpenAI + Groq unified) ----------
 async function aiScores(model, endpoint, key, items) {
   try {
-    const { data } = await axios.post(endpoint, {
-      model,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: 'system', content:
-          "You are an on-chain momentum analyst. Return JSON mapping each pool address to {score(0-100),risk,tags,reason}. Reward fresh volume bursts, strong buyer ratios, low FDV vs liquidity, early stage growth. Penalize heavy sells or dead liquidity."},
-        { role: 'user', content: JSON.stringify(items) }
-      ]
-    }, { headers:{Authorization:`Bearer ${key}`}, timeout:Number(AI_TIMEOUT_MS) });
-    return JSON.parse(data.choices[0].message.content);
+    const isClaude = endpoint.includes('anthropic');
+    const payload = isClaude
+      ? {
+          model,
+          max_tokens: 1024,
+          messages: [
+            {
+              role: 'user',
+              content: `Analyze these pools and return JSON mapping each address to {score(0-100),risk,tags,reason}. Reward fresh volume bursts, strong buyer ratios, low FDV vs liquidity, early stage growth. Penalize heavy sells or dead liquidity. Pools: ${JSON.stringify(items)}`
+            }
+          ]
+        }
+      : {
+          model,
+          temperature: 0.2,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: 'system',
+              content:
+                "You are an on-chain momentum analyst. Return JSON mapping each pool address to {score(0-100),risk,tags,reason}. Reward fresh volume bursts, strong buyer ratios, low FDV vs liquidity, early stage growth. Penalize heavy sells or dead liquidity."
+            },
+            { role: 'user', content: JSON.stringify(items) }
+          ]
+        };
+
+    const headers = isClaude
+      ? { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+      : { Authorization: `Bearer ${key}`, 'content-type': 'application/json' };
+
+    const { data } = await axios.post(endpoint, payload, { headers, timeout: Number(AI_TIMEOUT_MS) });
+
+    const raw = isClaude ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
+    return JSON.parse(raw || '{}');
   } catch (e) {
-    console.error(`[AI/${model}] fail:`,e.message);
+    console.error(`[AI/${model}] fail:`, e.response?.status, e.message);
     return {};
   }
 }
 
 async function getAIScores(items) {
-  const [openai,claude,groq] = await Promise.allSettled([
-    OPENAI_API_KEY?aiScores(AI_MODEL,'https://api.openai.com/v1/chat/completions',OPENAI_API_KEY,items):{},
-    CLAUDE_API_KEY?aiScores(CLAUDE_MODEL,'https://api.anthropic.com/v1/messages',CLAUDE_API_KEY,items):{},
-    GROQ_API_KEY?aiScores(GROQ_MODEL,'https://api.groq.com/openai/v1/chat/completions',GROQ_API_KEY,items):{}
+  const [openai, claude, groq] = await Promise.allSettled([
+    OPENAI_API_KEY ? aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items) : {},
+    CLAUDE_API_KEY ? aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items) : {},
+    GROQ_API_KEY ? aiScores(GROQ_MODEL, 'https://api.groq.com/openai/v1/chat/completions', GROQ_API_KEY, items) : {}
   ]);
-  const merged={};
+
+  const merged = {};
   for (const it of items) {
-    const addr=it.address;
-    const scores=[
-      openai.value?.[addr]?.score,claude.value?.[addr]?.score,groq.value?.[addr]?.score
-    ].filter(x=>typeof x==='number');
+    const addr = it.address;
+    const scores = [openai.value?.[addr]?.score, claude.value?.[addr]?.score, groq.value?.[addr]?.score].filter(
+      (x) => typeof x === 'number'
+    );
     if (!scores.length) continue;
-    const avg=scores.reduce((a,b)=>a+b,0)/scores.length;
-    merged[addr]={
-      score:avg,
-      risk:openai.value?.[addr]?.risk||claude.value?.[addr]?.risk||'med',
-      tags:openai.value?.[addr]?.tags||[],
-      reason:openai.value?.[addr]?.reason||'',
-      disagree:(Math.max(...scores)-Math.min(...scores))>30
+    const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+    merged[addr] = {
+      score: avg,
+      risk: openai.value?.[addr]?.risk || claude.value?.[addr]?.risk || 'med',
+      tags: openai.value?.[addr]?.tags || [],
+      reason: openai.value?.[addr]?.reason || '',
+      disagree: Math.max(...scores) - Math.min(...scores) > 30
     };
   }
   return merged;
@@ -184,39 +208,47 @@ async function getAIScores(items) {
 
 // ---------- RANKING ----------
 function baseHotness(f) {
-  const burstBoost=Math.max(0,f.vol24_delta_5m)*2;
-  const buyerBoost=(f.buyers24||0)*50;
-  const recencyBonus=f.age_min<360?500:0;
-  const sellPenalty=f.buy_sell_ratio<0.5?f.vol24_now*0.1:0;
-  return f.vol24_now+burstBoost+buyerBoost+recencyBonus-sellPenalty;
+  const burstBoost = Math.max(0, f.vol24_delta_5m) * 2;
+  const buyerBoost = (f.buyers24 || 0) * 50;
+  const recencyBonus = f.age_min < 360 ? 500 : 0;
+  const sellPenalty = f.buy_sell_ratio < 0.5 ? f.vol24_now * 0.1 : 0;
+  return f.vol24_now + burstBoost + buyerBoost + recencyBonus - sellPenalty;
 }
 
 function computeBurstLabel(f) {
-  if (f.vol24_delta_5m>=Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate*100>=Number(BURST_MIN_PCT))
-    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate*100).toFixed(1)}%)\n`;
+  if (f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT))
+    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
   return '';
 }
 
 // ---------- TG OUTPUT ----------
 function formatTrending(rows, aiMap) {
-  if (!rows.length) return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
-  const lines=[`🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,`🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`];
-  for (let i=0;i<rows.length;i++) {
-    const r=rows[i];
-    const a=r.pool.attributes;
-    const f=r.feat;
-    const ai=aiMap[f.address]||{};
-    const tagsLine=ai.tags?.length?`🏷 ${esc(ai.tags.join(', '))}\n`:``;
-    const disagreeIcon=ai.disagree?'🟡 ':'';
-    let pressure='';
-    if (f.buys24>f.sells24*2) pressure='🟢 <b>Strong Buy Pressure</b>\n';
-    else if (f.sells24>f.buys24*2) pressure='🔻 <b>Heavy Sell Pressure</b>\n';
-    const histLine=f.hist_avg?`📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct>=0?'+':'')}${f.vol_vs_avg_pct.toFixed(1)}%\n`:'';
+  if (!rows.length)
+    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
+  const lines = [
+    `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
+    `🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`
+  ];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const a = r.pool.attributes;
+    const f = r.feat;
+    const ai = aiMap[f.address] || {};
+    const tagsLine = ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : ``;
+    const disagreeIcon = ai.disagree ? '🟡 ' : '';
+    let pressure = '';
+    if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
+    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
+    const histLine = f.hist_avg
+      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
+      : '';
     lines.push(
-`${i+1}️⃣ <b>${esc(a.name)}</b>\n${computeBurstLabel(f)}${pressure}${tagsLine}`+
-`💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n`+
-`🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${disagreeIcon}${ai.score?.toFixed(1)||'0'}/100 | 📈 24h: ${Number(a.price_change_percentage?.h24||0).toFixed(2)}%\n`+
-`${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
+      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${computeBurstLabel(f)}${pressure}${tagsLine}` +
+        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
+        `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${disagreeIcon}${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
+          a.price_change_percentage?.h24 || 0
+        ).toFixed(2)}%\n` +
+        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
     );
   }
   return lines.join('\n');
@@ -225,31 +257,48 @@ function formatTrending(rows, aiMap) {
 // ---------- MAIN ----------
 async function postTrending() {
   try {
-    const raw=await safeFetch(fetchAllPools);
-    const candidates=raw.filter(isGoodPool);
-    const feats=candidates.map(buildFeatures);
-    for (const f of feats) updateHistory(f.address,f.vol24_now);
-    fs.writeFileSync(HISTORY_FILE,JSON.stringify(history,null,2));
-    const aiMap=await getAIScores(feats);
-    const scored=feats.map(f=>{
-      const aiScore=aiMap[f.address]?.score||0;
-      return {feat:f,pool:candidates.find(p=>p.attributes.address===f.address),final:baseHotness(f)+aiScore*Number(AI_WEIGHT)};
-    }).sort((a,b)=>b.final-a.final);
-    const top=scored.slice(0,Number(TRENDING_SIZE));
-    const msg=await bot.sendMessage(TELEGRAM_CHAT_ID,formatTrending(top,aiMap),{parse_mode:'HTML',disable_web_page_preview:true});
+    const raw = await safeFetch(fetchAllPools);
+    const candidates = raw.filter(isGoodPool);
+    const feats = candidates.map(buildFeatures);
+    for (const f of feats) updateHistory(f.address, f.vol24_now);
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+    const aiMap = await getAIScores(feats);
+    const scored = feats
+      .map((f) => {
+        const aiScore = aiMap[f.address]?.score || 0;
+        return {
+          feat: f,
+          pool: candidates.find((p) => p.attributes.address === f.address),
+          final: baseHotness(f) + aiScore * Number(AI_WEIGHT)
+        };
+      })
+      .sort((a, b) => b.final - a.final);
+    const top = scored.slice(0, Number(TRENDING_SIZE));
+    const msg = await bot.sendMessage(
+      TELEGRAM_CHAT_ID,
+      formatTrending(top, aiMap),
+      { parse_mode: 'HTML', disable_web_page_preview: true }
+    );
     if (lastPinnedId) {
-      await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(()=>{});
-      await bot.deleteMessage(TELEGRAM_CHAT_ID,lastPinnedId).catch(()=>{});
+      await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
+      await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(() => {});
     }
-    await bot.pinChatMessage(TELEGRAM_CHAT_ID,msg.message_id,{disable_notification:true});
-    lastPinnedId=msg.message_id;
-    for (const c of candidates) lastVolumes.set(c.attributes.address,Number(c.attributes.volume_usd?.h24||0));
+    await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, { disable_notification: true });
+    lastPinnedId = msg.message_id;
+    for (const c of candidates)
+      lastVolumes.set(c.attributes.address, Number(c.attributes.volume_usd?.h24 || 0));
   } catch (e) {
-    console.error('[TrendingBot] Fail:',e.message);
-    await bot.sendMessage(TELEGRAM_CHAT_ID,`⚠️ <b>Trending Bot Alert:</b> API unavailable. Using last pinned snapshot.`,{parse_mode:'HTML'}).catch(()=>{});
+    console.error('[TrendingBot] Fail:', e.message);
+    await bot
+      .sendMessage(
+        TELEGRAM_CHAT_ID,
+        `⚠️ <b>Trending Bot Alert:</b> API unavailable. Using last pinned snapshot.`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
   }
 }
 
 console.log('✅ AI-Powered BESC Trending Bot v3 running...');
-setInterval(postTrending,Number(POLL_INTERVAL_MINUTES)*60*1000);
+setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
