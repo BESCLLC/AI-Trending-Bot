@@ -26,7 +26,7 @@ const {
   OPENAI_API_KEY,
   AI_MODEL = 'gpt-4o-mini',
   AI_WEIGHT = '1500',
-  AI_TIMEOUT_MS = '15000', // bumped to 15s for Claude reliability
+  AI_TIMEOUT_MS = '15000',
 
   CLAUDE_API_KEY,
   CLAUDE_MODEL = 'claude-sonnet-4-20250514',
@@ -36,7 +36,7 @@ const {
   SPONSORED_POOLS = '',
 
   HISTORY_FILE = './history.json',
-  HISTORY_MAX_POINTS = '2016', // 7 days @ 5min intervals
+  HISTORY_MAX_POINTS = '2016',
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
@@ -121,8 +121,7 @@ function isGoodPool(p) {
   const liq = Number(a.reserve_in_usd || 0);
   const vol = Number(a.volume_usd?.h24 || 0);
   const buys = Number(a.transactions?.h24?.buys || 0);
-  const ageMin =
-    (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
+  const ageMin = (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
   return liq >= MIN_LIQ_USD && vol >= MIN_VOL24_USD && buys >= MIN_BUYS_24H && ageMin >= 3;
 }
 
@@ -139,8 +138,7 @@ function buildFeatures(p) {
   const sells = Number(a.transactions?.h24?.sells || 0);
   const buyers = Number(a.transactions?.h24?.buyers || 0);
   const bsr = (buys + 1) / (sells + 1);
-  const ageMin =
-    (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
+  const ageMin = (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
   const histStats = getHistoryStats(a.address);
   return {
     address: a.address,
@@ -173,31 +171,32 @@ function extractJsonString(text) {
   return text.slice(start, end + 1);
 }
 
-async function aiScores(model, endpoint, key, items) {
+async function aiScores(model, endpoint, key, items, isSummary = false) {
   try {
     const isClaude = endpoint.includes('anthropic');
     const payload = isClaude
       ? {
           model,
-          max_tokens: 1024,
+          max_tokens: isSummary ? 300 : 1024,
           messages: [
             {
               role: 'user',
-              content: `Return ONLY valid JSON. No text, no intro, no markdown. Map each pool address to: {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short explanation"}. Pools: ${JSON.stringify(
-                items
-              )}`,
+              content: isSummary
+                ? `Give me a 1-2 sentence market summary for these pools: ${JSON.stringify(items)}`
+                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words"}. Pools: ${JSON.stringify(items)}`,
             },
           ],
         }
       : {
           model,
           temperature: 0.2,
-          response_format: { type: 'json_object' },
+          response_format: isSummary ? undefined : { type: 'json_object' },
           messages: [
             {
               role: 'system',
-              content:
-                'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score(0-100),risk,tags,reason}.',
+              content: isSummary
+                ? 'You are a crypto market analyst. Summarize market in 1-2 sentences.'
+                : 'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score,risk,tags,reason}.',
             },
             { role: 'user', content: JSON.stringify(items) },
           ],
@@ -219,45 +218,21 @@ async function aiScores(model, endpoint, key, items) {
       timeout: Number(AI_TIMEOUT_MS),
     });
 
-    let raw = isClaude
-      ? data.content?.[0]?.text
-      : data.choices?.[0]?.message?.content;
+    let raw = isClaude ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
+    if (isClaude && !isSummary) raw = extractJsonString(raw);
 
-    if (isClaude) raw = extractJsonString(raw);
-
-    return JSON.parse(raw || '{}');
+    return isSummary ? raw : JSON.parse(raw || '{}');
   } catch (e) {
-    console.error(`[AI/${model}] fail:`, e.response?.status, e.message);
-    return {};
+    console.error(`[AI/${model}] fail:`, e.message);
+    return isSummary ? '' : {};
   }
 }
 
 async function getAIScores(items) {
   const [openai, claude, groq] = await Promise.allSettled([
-    OPENAI_API_KEY
-      ? aiScores(
-          AI_MODEL,
-          'https://api.openai.com/v1/chat/completions',
-          OPENAI_API_KEY,
-          items
-        )
-      : {},
-    CLAUDE_API_KEY
-      ? aiScores(
-          CLAUDE_MODEL,
-          'https://api.anthropic.com/v1/messages',
-          CLAUDE_API_KEY,
-          items
-        )
-      : {},
-    GROQ_API_KEY
-      ? aiScores(
-          GROQ_MODEL,
-          'https://api.groq.com/openai/v1/chat/completions',
-          GROQ_API_KEY,
-          items
-        )
-      : {},
+    OPENAI_API_KEY ? aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items) : {},
+    CLAUDE_API_KEY ? aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items) : {},
+    GROQ_API_KEY ? aiScores(GROQ_MODEL, 'https://api.groq.com/openai/v1/chat/completions', GROQ_API_KEY, items) : {},
   ]);
 
   const merged = {};
@@ -274,22 +249,18 @@ async function getAIScores(items) {
     const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
     merged[addr] = {
       score: avg,
-      risk:
-        openai.value?.[addr]?.risk ||
-        claude.value?.[addr]?.risk ||
-        'med',
-      tags:
-        openai.value?.[addr]?.tags ||
-        claude.value?.[addr]?.tags ||
-        [],
-      reason:
-        openai.value?.[addr]?.reason ||
-        claude.value?.[addr]?.reason ||
-        '',
+      risk: openai.value?.[addr]?.risk || claude.value?.[addr]?.risk || 'med',
+      tags: openai.value?.[addr]?.tags || claude.value?.[addr]?.tags || [],
+      reason: openai.value?.[addr]?.reason || claude.value?.[addr]?.reason || '',
       disagree: Math.max(...scores) - Math.min(...scores) > 30,
     };
   }
   return merged;
+}
+
+async function getMarketSummary(items) {
+  if (!OPENAI_API_KEY) return '';
+  return await aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items, true);
 }
 
 // ---------- RANKING ----------
@@ -297,68 +268,53 @@ function baseHotness(f) {
   const burstBoost = Math.max(0, f.vol24_delta_5m) * 2;
   const buyerBoost = (f.buyers24 || 0) * 50;
   const recencyBonus = f.age_min < 360 ? 500 : 0;
-  const sellPenalty =
-    f.buy_sell_ratio < 0.5 ? f.vol24_now * 0.1 : 0;
-  return (
-    f.vol24_now + burstBoost + buyerBoost + recencyBonus - sellPenalty
-  );
+  const sellPenalty = f.buy_sell_ratio < 0.5 ? f.vol24_now * 0.1 : 0;
+  return f.vol24_now + burstBoost + buyerBoost + recencyBonus - sellPenalty;
 }
 
 function computeBurstLabel(f) {
-  if (
-    f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) &&
-    f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT)
-  )
-    return `⚡ <b>Vol Burst:</b> +${fmtUsd(
-      f.vol24_delta_5m
-    )} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
+  if (f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT))
+    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
   return '';
 }
 
 // ---------- TG OUTPUT ----------
-function formatTrending(rows, aiMap) {
+function formatTrending(rows, aiMap, summary) {
   if (!rows.length)
     return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
+
   const lines = [
     `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
     `🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`,
   ];
+
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     const a = r.pool.attributes;
     const f = r.feat;
     const ai = aiMap[f.address] || {};
-    const tagsLine = ai.tags?.length
-      ? `🏷 ${esc(ai.tags.join(', '))}\n`
-      : ``;
-    const disagreeIcon = ai.disagree ? '🟡 ' : '';
+    const tagsLine = ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : ``;
+    const reasonLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : '';
+    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
+    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
     let pressure = '';
-    if (f.buys24 > f.sells24 * 2)
-      pressure = '🟢 <b>Strong Buy Pressure</b>\n';
-    else if (f.sells24 > f.buys24 * 2)
-      pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
+    if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
+    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
     const histLine = f.hist_avg
-      ? `📊 <b>vs 7d Avg:</b> ${
-          f.vol_vs_avg_pct >= 0 ? '+' : ''
-        }${f.vol_vs_avg_pct.toFixed(1)}%\n`
+      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
       : '';
     lines.push(
-      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${computeBurstLabel(
-        f
-      )}${pressure}${tagsLine}` +
-        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(
-          f.liq_usd
-        )}\n` +
-        `🏦 <b>FDV:</b> ${fmtUsd(
-          f.fdv_usd
-        )} | 🤖 ${disagreeIcon}${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
+      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${tagsLine}${reasonLine}` +
+        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
+        `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
           a.price_change_percentage?.h24 || 0
         ).toFixed(2)}%\n` +
-        `${histLine}<a href="${esc(
-          f.link
-        )}">📊 View on GeckoTerminal</a>\n`
+        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
     );
   }
+
+  if (summary) lines.push(`\n📊 <b>AI Market Take:</b> <i>${esc(summary)}</i>`);
+
   return lines.join('\n');
 }
 
@@ -377,27 +333,24 @@ async function postTrending() {
         const aiScore = aiMap[f.address]?.score || 0;
         return {
           feat: f,
-          pool: candidates.find(
-            (p) => p.attributes.address === f.address
-          ),
-          final:
-            baseHotness(f) + aiScore * Number(AI_WEIGHT),
+          pool: candidates.find((p) => p.attributes.address === f.address),
+          final: baseHotness(f) + aiScore * Number(AI_WEIGHT),
         };
       })
       .sort((a, b) => b.final - a.final);
 
     const top = scored.slice(0, Number(TRENDING_SIZE));
+    const summary = await getMarketSummary(top.map((t) => t.feat));
+
     const msg = await bot.sendMessage(
       TELEGRAM_CHAT_ID,
-      formatTrending(top, aiMap),
+      formatTrending(top, aiMap, summary),
       { parse_mode: 'HTML', disable_web_page_preview: true }
     );
 
     if (lastPinnedId) {
       await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
-      await bot
-        .deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId)
-        .catch(() => {});
+      await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(() => {});
     }
     await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, {
       disable_notification: true,
@@ -405,10 +358,7 @@ async function postTrending() {
     lastPinnedId = msg.message_id;
 
     for (const c of candidates)
-      lastVolumes.set(
-        c.attributes.address,
-        Number(c.attributes.volume_usd?.h24 || 0)
-      );
+      lastVolumes.set(c.attributes.address, Number(c.attributes.volume_usd?.h24 || 0));
   } catch (e) {
     console.error('[TrendingBot] Fail:', e.message);
     await bot
@@ -421,6 +371,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v3 running...');
+console.log('✅ AI-Powered BESC Trending Bot v4 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
