@@ -21,7 +21,6 @@ const {
   NEW_POOL_MIN_LIQ_USD = '5000',
   NEW_POOL_MIN_VOL24_USD = '1000',
   NEW_POOL_MIN_BUYERS = '5',
-  NEW_ALERT_COOLDOWN_MIN = '60',
 
   OPENAI_API_KEY,
   AI_MODEL = 'gpt-4o-mini',
@@ -33,8 +32,6 @@ const {
   GROQ_API_KEY,
   GROQ_MODEL = 'llama-3.1-70b-versatile',
 
-  SPONSORED_POOLS = '',
-
   HISTORY_FILE = './history.json',
   HISTORY_MAX_POINTS = '2016',
 } = process.env;
@@ -42,10 +39,9 @@ const {
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
   throw new Error('Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID');
 
-const bot = new TelegramBot(TELEGRAM_TOKEN);
+const bot = new TelegramBot(TELEGRAM_CHAT_ID ? TELEGRAM_TOKEN : '');
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const lastVolumes = new Map();
-const alertedNewPools = new Map();
 let lastPinnedId = null;
 
 // ---------- HISTORY ----------
@@ -62,9 +58,11 @@ function updateHistory(address, vol24) {
 
 function getHistoryStats(address) {
   const arr = history[address] || [];
-  if (!arr.length) return { avg: 0 };
+  if (!arr.length) return { avg: 0, min: 0, max: 0 };
   const avg = arr.reduce((a, b) => a + b.v, 0) / arr.length;
-  return { avg };
+  const min = Math.min(...arr.map(x => x.v));
+  const max = Math.max(...arr.map(x => x.v));
+  return { avg, min, max };
 }
 
 // ---------- UTILS ----------
@@ -76,10 +74,7 @@ const fmtUsd = (n) => {
 };
 
 const esc = (s = '') =>
-  String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 const nowMs = () => Date.now();
 
@@ -106,10 +101,7 @@ async function fetchPoolsPage(page = 1) {
 }
 
 async function fetchAllPools() {
-  const [p1, p2] = await Promise.allSettled([
-    fetchPoolsPage(1),
-    fetchPoolsPage(2),
-  ]);
+  const [p1, p2] = await Promise.allSettled([fetchPoolsPage(1), fetchPoolsPage(2)]);
   const arr = [];
   if (p1.status === 'fulfilled') arr.push(...p1.value);
   if (p2.status === 'fulfilled') arr.push(...p2.value);
@@ -121,8 +113,7 @@ function isGoodPool(p) {
   const liq = Number(a.reserve_in_usd || 0);
   const vol = Number(a.volume_usd?.h24 || 0);
   const buys = Number(a.transactions?.h24?.buys || 0);
-  const ageMin =
-    (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
+  const ageMin = (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
   return liq >= MIN_LIQ_USD && vol >= MIN_VOL24_USD && buys >= MIN_BUYS_24H && ageMin >= 3;
 }
 
@@ -139,8 +130,7 @@ function buildFeatures(p) {
   const sells = Number(a.transactions?.h24?.sells || 0);
   const buyers = Number(a.transactions?.h24?.buyers || 0);
   const bsr = (buys + 1) / (sells + 1);
-  const ageMin =
-    (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
+  const ageMin = (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
   const histStats = getHistoryStats(a.address);
   return {
     address: a.address,
@@ -157,9 +147,9 @@ function buildFeatures(p) {
     buys24: buys,
     sells24: sells,
     hist_avg: histStats.avg,
-    vol_vs_avg_pct: histStats.avg
-      ? ((volNow - histStats.avg) / histStats.avg) * 100
-      : 0,
+    hist_min: histStats.min,
+    hist_max: histStats.max,
+    vol_vs_avg_pct: histStats.avg ? ((volNow - histStats.avg) / histStats.avg) * 100 : 0,
     link: `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`,
   };
 }
@@ -168,116 +158,69 @@ function buildFeatures(p) {
 function cleanJsonString(raw) {
   if (!raw) return '{}';
   const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) return '{}';
-  let json = match[0];
+  let json = match ? match[0] : raw;
   json = json.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
-  try {
-    JSON.parse(json);
-    return json;
-  } catch (err) {
-    console.warn('[AI] JSON parse failed, attempting recovery...');
-    json = json.replace(/[^\x20-\x7E\n\r\t]/g, '');
-    json = json.slice(0, json.lastIndexOf('}') + 1);
-    return json;
-  }
+  return json;
 }
 
 async function aiScores(model, endpoint, key, items, isSummary = false) {
   try {
-    const isClaude = endpoint.includes('anthropic');
-    const payload = isClaude
+    const payload = endpoint.includes('anthropic')
       ? {
           model,
           max_tokens: isSummary ? 300 : 1024,
-          messages: [
-            {
-              role: 'user',
-              content: isSummary
-                ? `Give me a 1-2 sentence market summary and price direction for these pools: ${JSON.stringify(items)}`
-                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
-            },
-          ],
+          messages: [{ role: 'user', content: isSummary
+            ? `Give me a 1-2 sentence market summary with risk level and trade outlook for these pools: ${JSON.stringify(items)}`
+            : `Return ONLY valid JSON. For each pool return {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways","stop_loss":"suggested stop","take_profit":"suggested TP"}. Pools: ${JSON.stringify(items)}` }],
         }
       : {
           model,
           temperature: 0.2,
           response_format: isSummary ? undefined : { type: 'json_object' },
           messages: [
-            {
-              role: 'system',
-              content: isSummary
-                ? 'You are a crypto market analyst. Summarize market and give a price trend outlook.'
-                : 'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score,risk,tags,reason,prediction}.',
-            },
+            { role: 'system', content: 'You are an elite crypto trading assistant. Output clear JSON only.' },
             { role: 'user', content: JSON.stringify(items) },
           ],
         };
 
-    const headers = isClaude
-      ? {
-          'x-api-key': key,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
-        }
-      : {
-          Authorization: `Bearer ${key}`,
-          'content-type': 'application/json',
-        };
+    const headers = endpoint.includes('anthropic')
+      ? { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+      : { Authorization: `Bearer ${key}`, 'content-type': 'application/json' };
 
-    const { data } = await axios.post(endpoint, payload, {
-      headers,
-      timeout: Number(AI_TIMEOUT_MS),
-    });
-
-    let raw = isClaude ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
+    const { data } = await axios.post(endpoint, payload, { headers, timeout: Number(AI_TIMEOUT_MS) });
+    let raw = endpoint.includes('anthropic') ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
     raw = cleanJsonString(raw);
-
     return isSummary ? raw.trim() : JSON.parse(raw || '{}');
   } catch (e) {
     console.error(`[AI/${model}] fail:`, e.message);
-    return isSummary ? '' : {};
-  }
-}
-
-async function getAIScores(items) {
-  try {
-    const [openai, claude, groq] = await Promise.allSettled([
-      OPENAI_API_KEY ? aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items) : {},
-      CLAUDE_API_KEY ? aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items) : {},
-      GROQ_API_KEY ? aiScores(GROQ_MODEL, 'https://api.groq.com/openai/v1/chat/completions', GROQ_API_KEY, items) : {},
-    ]);
-
-    const merged = {};
-    for (const it of items) {
-      const addr = it.address;
-      const scores = [
-        openai.value?.[addr]?.score,
-        claude.value?.[addr]?.score,
-        groq.value?.[addr]?.score,
-      ].filter((x) => typeof x === 'number');
-
-      if (!scores.length) continue;
-
-      const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
-      merged[addr] = {
-        score: avg,
-        risk: openai.value?.[addr]?.risk || claude.value?.[addr]?.risk || 'med',
-        tags: openai.value?.[addr]?.tags || claude.value?.[addr]?.tags || [],
-        reason: openai.value?.[addr]?.reason || claude.value?.[addr]?.reason || '',
-        prediction: openai.value?.[addr]?.prediction || claude.value?.[addr]?.prediction || '',
-        disagree: Math.max(...scores) - Math.min(...scores) > 30,
-      };
-    }
-    return merged;
-  } catch (err) {
-    console.error('[AI] Failed to aggregate scores:', err.message);
     return {};
   }
 }
 
-async function getMarketSummary(items) {
-  if (!OPENAI_API_KEY) return '';
-  return await aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items, true);
+async function getAIScores(items) {
+  const results = await Promise.allSettled([
+    OPENAI_API_KEY ? aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items) : {},
+    CLAUDE_API_KEY ? aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items) : {},
+    GROQ_API_KEY ? aiScores(GROQ_MODEL, 'https://api.groq.com/openai/v1/chat/completions', GROQ_API_KEY, items) : {},
+  ]);
+
+  const merged = {};
+  for (const it of items) {
+    const addr = it.address;
+    const scores = results.map(r => r.value?.[addr]?.score).filter(n => typeof n === 'number');
+    const avg = scores.length ? scores.reduce((a,b) => a+b, 0)/scores.length : 50;
+    merged[addr] = {
+      score: avg,
+      risk: results.find(r => r.value?.[addr]?.risk)?.value?.[addr]?.risk || 'med',
+      tags: results.find(r => r.value?.[addr]?.tags)?.value?.[addr]?.tags || [],
+      reason: results.find(r => r.value?.[addr]?.reason)?.value?.[addr]?.reason || '',
+      prediction: results.find(r => r.value?.[addr]?.prediction)?.value?.[addr]?.prediction || '',
+      stop_loss: results.find(r => r.value?.[addr]?.stop_loss)?.value?.[addr]?.stop_loss || '',
+      take_profit: results.find(r => r.value?.[addr]?.take_profit)?.value?.[addr]?.take_profit || '',
+      disagree: Math.max(...scores, 0) - Math.min(...scores, 0) > 30,
+    };
+  }
+  return merged;
 }
 
 // ---------- RANKING ----------
@@ -291,48 +234,30 @@ function baseHotness(f) {
 
 function computeBurstLabel(f) {
   if (f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT))
-    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
+    return `⚡ Vol Burst: +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
   return '';
 }
 
 // ---------- TG OUTPUT ----------
-function formatTrending(rows, aiMap, summary) {
-  if (!rows.length)
-    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
-
+function formatTrending(rows, aiMap) {
   const lines = [
     `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
     `🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`,
   ];
 
   for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    const a = r.pool.attributes;
-    const f = r.feat;
+    const r = rows[i]; const a = r.pool.attributes; const f = r.feat;
     const ai = aiMap[f.address] || {};
-    const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '⚠️' : '';
-    const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
-    const predictionLine = ai.prediction ? `${icon} <b>AI Prediction:</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
-    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
-    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
-    let pressure = '';
-    if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
-    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
-    const histLine = f.hist_avg
-      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
-      : '';
+    const riskIcon = ai.risk === 'low' ? '🟩' : ai.risk === 'high' ? '🟥' : '🟨';
+    const momentum = f.vol24_delta_5m > (f.hist_avg || 0)*0.05 ? '🔥 High Momentum' : f.vol24_delta_5m < 0 ? '🧊 Cooling Off' : '';
     lines.push(
-      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
-        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
-        `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
-          a.price_change_percentage?.h24 || 0
-        ).toFixed(2)}%\n` +
-        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
+      `${i+1}️⃣ <b>${esc(a.name)}</b> | ${riskIcon} Risk | 🤖 ${ai.score?.toFixed(1) || 50}/100 ${ai.disagree ? '⚠️ Model Disagreement' : ''}\n` +
+      `${computeBurstLabel(f)}${momentum}\n${ai.prediction ? `📈 AI: ${ai.prediction.toUpperCase()}` : ''} ${ai.reason ? `💡 ${esc(ai.reason)}` : ''}\n` +
+      `💵 Vol: ${fmtUsd(f.vol24_now)} | 💧 LQ: ${fmtUsd(f.liq_usd)} | 🛒 Buys: ${f.buys24} / Sells: ${f.sells24}\n` +
+      `🏦 FDV: ${fmtUsd(f.fdv_usd)} | 📊 vs 7d: ${(f.vol_vs_avg_pct>=0?'+':'')}${f.vol_vs_avg_pct.toFixed(1)}%\n` +
+      `${ai.stop_loss ? `🛑 SL: ${ai.stop_loss}` : ''} ${ai.take_profit ? `🎯 TP: ${ai.take_profit}` : ''}\n<a href="${esc(f.link)}">📊 View Pool</a>\n`
     );
   }
-
-  if (summary) lines.push(`\n📊 <b>AI Market Take:</b> <i>${esc(summary)}</i>`);
-
   return lines.join('\n');
 }
 
@@ -346,49 +271,28 @@ async function postTrending() {
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
 
     const aiMap = await getAIScores(feats);
-    const scored = feats
-      .map((f) => {
-        const aiScore = aiMap[f.address]?.score || 0;
-        return {
-          feat: f,
-          pool: candidates.find((p) => p.attributes.address === f.address),
-          final: baseHotness(f) + aiScore * Number(AI_WEIGHT),
-        };
-      })
-      .sort((a, b) => b.final - a.final);
+    const scored = feats.map(f => ({
+      feat: f,
+      pool: candidates.find(p => p.attributes.address === f.address),
+      final: baseHotness(f) + (aiMap[f.address]?.score || 50) * Number(AI_WEIGHT),
+    })).sort((a,b) => b.final - a.final);
 
     const top = scored.slice(0, Number(TRENDING_SIZE));
-    const summary = await getMarketSummary(top.map((t) => t.feat));
-
-    const msg = await bot.sendMessage(
-      TELEGRAM_CHAT_ID,
-      formatTrending(top, aiMap, summary),
-      { parse_mode: 'HTML', disable_web_page_preview: true }
-    );
+    const msg = await bot.sendMessage(TELEGRAM_CHAT_ID, formatTrending(top, aiMap),
+      { parse_mode: 'HTML', disable_web_page_preview: true });
 
     if (lastPinnedId) {
-      await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
-      await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(() => {});
+      await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(()=>{});
+      await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(()=>{});
     }
-    await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, {
-      disable_notification: true,
-    });
+    await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, { disable_notification: true });
     lastPinnedId = msg.message_id;
-
-    for (const c of candidates)
-      lastVolumes.set(c.attributes.address, Number(c.attributes.volume_usd?.h24 || 0));
+    for (const c of candidates) lastVolumes.set(c.attributes.address, Number(c.attributes.volume_usd?.h24 || 0));
   } catch (e) {
     console.error('[TrendingBot] Fail:', e.message);
-    await bot
-      .sendMessage(
-        TELEGRAM_CHAT_ID,
-        `⚠️ <b>Trending Bot Alert:</b> API unavailable. Using last pinned snapshot.`,
-        { parse_mode: 'HTML' }
-      )
-      .catch(() => {});
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v8 running...');
+console.log('✅ AI-Powered BESC Trending Bot v9 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
