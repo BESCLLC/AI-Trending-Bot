@@ -184,7 +184,7 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             {
               role: 'user',
               content: isSummary
-                ? `Give me a 1 sentence market summary and price direction for these pools: ${JSON.stringify(items)}`
+                ? `Give me a breif market summary and price direction for these pools: ${JSON.stringify(items)}`
                 : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
             },
           ],
