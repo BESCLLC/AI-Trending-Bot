@@ -297,23 +297,21 @@ function formatTrending(rows, aiMap, summary) {
     const f = r.feat;
     const ai = aiMap[f.address] || {};
     const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '⚠️' : '';
-    const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
+    const shortReason = ai.reason ? esc(ai.reason.substring(0, 50)) + (ai.reason.length > 50 ? '...' : '') : '';
+    const insightLine = shortReason ? `💡 <i>${shortReason}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.slice(0,3).join(', '))}${ai.tags.length > 3 ? '...' : ''}\n` : '');
     const predictionLine = ai.prediction ? `${icon} <b>AI Prediction:</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
     const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
     const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
     let pressure = '';
     if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
     else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
-    const histLine = f.hist_avg
-      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
-      : '';
     lines.push(
       `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
         `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
         `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
           a.price_change_percentage?.h24 || 0
         ).toFixed(2)}%\n` +
-        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
+        `<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
     );
   }
 
