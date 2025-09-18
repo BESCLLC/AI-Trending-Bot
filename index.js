@@ -165,10 +165,8 @@ function buildFeatures(p) {
 // ---------- AI SCORING ----------
 function cleanJsonString(raw) {
   if (!raw) return '{}';
-  // Extract JSON block
   const match = raw.match(/\{[\s\S]*\}/);
   let json = match ? match[0] : raw;
-  // Remove trailing commas before } or ]
   json = json.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
   return json;
 }
@@ -179,13 +177,13 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
     const payload = isClaude
       ? {
           model,
-          max_tokens: isSummary ? 300 : 1024,
+          max_tokens: isSummary ? 150 : 1024, // Reduced for shorter summary
           messages: [
             {
               role: 'user',
               content: isSummary
-                ? `Give me a 1-2 sentence market summary and price direction for these pools: ${JSON.stringify(items)}`
-                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
+                ? `Provide a concise 100-150 word market summary and price trend outlook for these pools: ${JSON.stringify(items)}`
+                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight under 15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
             },
           ],
         }
@@ -197,7 +195,7 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             {
               role: 'system',
               content: isSummary
-                ? 'You are a crypto market analyst. Summarize market and give a price trend outlook.'
+                ? 'You are a crypto market analyst. Provide a concise 100-150 word summary and price trend outlook.'
                 : 'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score,risk,tags,reason,prediction}.',
             },
             { role: 'user', content: JSON.stringify(items) },
@@ -282,9 +280,44 @@ function computeBurstLabel(f) {
 }
 
 // ---------- TG OUTPUT ----------
+function truncateAtWordBoundary(text, maxLength) {
+  if (text.length <= maxLength) return text;
+  const truncated = text.substring(0, maxLength);
+  const lastSpace = truncated.lastIndexOf(' ');
+  if (lastSpace === -1) return truncated + '...';
+  return truncated.substring(0, lastSpace) + '...';
+}
+
+async function sendTelegramMessages(chatId, text, options) {
+  const maxLength = 4000; // Slightly below Telegram's 4096 limit
+  if (text.length <= maxLength) {
+    console.log(`[Telegram] Sending message, length: ${text.length}`);
+    return await bot.sendMessage(chatId, text, options);
+  }
+  const messages = [];
+  let currentMessage = '';
+  const lines = text.split('\n');
+  for (const line of lines) {
+    if (currentMessage.length + line.length + 1 > maxLength) {
+      messages.push(currentMessage);
+      currentMessage = '';
+    }
+    currentMessage += line + '\n';
+  }
+  if (currentMessage) messages.push(currentMessage);
+  const sentMessages = [];
+  for (const msg of messages) {
+    console.log(`[Telegram] Sending split message, length: ${msg.length}`);
+    sentMessages.push(await bot.sendMessage(chatId, msg, options));
+  }
+  return sentMessages[sentMessages.length - 1]; // Return last message for pinning
+}
+
 function formatTrending(rows, aiMap, summary) {
   if (!rows.length)
-    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
+    return `😴 <b>No trending pools right now</b>\n` +
+           `📊 BESC HyperChain: 739 TXNs, ${fmtUsd(85560)} Vol in 24h\n` +
+           `🕒 Check back in ${POLL_INTERVAL_MINUTES} min for updates.`;
 
   const lines = [
     `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
@@ -297,25 +330,29 @@ function formatTrending(rows, aiMap, summary) {
     const f = r.feat;
     const ai = aiMap[f.address] || {};
     const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '⚠️' : '';
-    const shortReason = ai.reason ? esc(ai.reason.substring(0, 50)) + (ai.reason.length > 50 ? '...' : '') : '';
-    const insightLine = shortReason ? `💡 <i>${shortReason}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.slice(0,3).join(', '))}${ai.tags.length > 3 ? '...' : ''}\n` : '');
+    const shortReason = ai.reason ? truncateAtWordBoundary(esc(ai.reason), 60) : '';
+    const tagString = ai.tags?.length ? esc(ai.tags.join(', ').substring(0, 50)) + (ai.tags.join(', ').length > 50 ? '...' : '') : '';
+    const insightLine = shortReason ? `💡 <i>${shortReason}</i>\n` : (tagString ? `🏷 ${tagString}\n` : '');
     const predictionLine = ai.prediction ? `${icon} <b>AI Prediction:</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
     const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
     const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
     let pressure = '';
     if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
     else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
+    const histLine = f.hist_avg
+      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
+      : '';
     lines.push(
       `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
         `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
         `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
           a.price_change_percentage?.h24 || 0
         ).toFixed(2)}%\n` +
-        `<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
+        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
     );
   }
 
-  if (summary) lines.push(`\n📊 <b>AI Market Take:</b> <i>${esc(summary)}</i>`);
+  if (summary) lines.push(`\n📊 <b>AI Market Take:</b> <i>${esc(truncateAtWordBoundary(summary, 500))}</i>`);
 
   return lines.join('\n');
 }
@@ -344,9 +381,10 @@ async function postTrending() {
     const top = scored.slice(0, Number(TRENDING_SIZE));
     const summary = await getMarketSummary(top.map((t) => t.feat));
 
-    const msg = await bot.sendMessage(
+    const msgText = formatTrending(top, aiMap, summary);
+    const msg = await sendTelegramMessages(
       TELEGRAM_CHAT_ID,
-      formatTrending(top, aiMap, summary),
+      msgText,
       { parse_mode: 'HTML', disable_web_page_preview: true }
     );
 
