@@ -184,7 +184,7 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             {
               role: 'user',
               content: isSummary
-                ? `Give me a breif market summary and price direction for these pools: ${JSON.stringify(items)}`
+                ? `Give me a sentence of the market summary and price direction for these pools: ${JSON.stringify(items)}`
                 : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
             },
           ],
@@ -317,7 +317,17 @@ function formatTrending(rows, aiMap, summary) {
     );
   }
 
-  if (summary) lines.push(`\n📊 <b>AI Market Take:</b> <i>${esc(summary)}</i>`);
+  if (summary) {
+    lines.push(`\n📊 <b>AI Market Take:</b>`);
+    // Only include the Price Trend Outlook section
+    const summaryLines = summary.split('\n');
+    const outlookIndex = summaryLines.findIndex(line => line.includes('Price Trend Outlook'));
+    if (outlookIndex !== -1) {
+      lines.push(...summaryLines.slice(outlookIndex).map(line => `<i>${esc(line)}</i>`));
+    } else {
+      lines.push(`<i>${esc(summary)}</i>`);
+    }
+  }
 
   return lines.join('\n');
 }
