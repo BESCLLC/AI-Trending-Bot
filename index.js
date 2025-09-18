@@ -25,7 +25,7 @@ const {
   OPENAI_API_KEY,
   AI_MODEL = 'gpt-4o-mini',
   AI_WEIGHT = '1500',
-  AI_TIMEOUT_MS = '15000',
+  AI_TIMEOUT_MS = '25000',
 
   CLAUDE_API_KEY,
   CLAUDE_MODEL = 'claude-sonnet-4-20250514',
