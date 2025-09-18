@@ -1,8 +1,9 @@
-import 'dotenv/config';
-import TelegramBot from 'node-telegram-bot-api';
-import axios from 'axios';
-import fs from 'fs';
-import crypto from 'crypto';
+// index.js
+require('dotenv').config();
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const fs = require('fs');
+const crypto = require('crypto');
 
 // ---------- ENV ----------
 const {
@@ -41,8 +42,9 @@ const {
   RISK_FILE = './risk_cache.json',
 } = process.env;
 
-if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
+if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
   throw new Error('Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID');
+}
 
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
@@ -51,6 +53,12 @@ const alertedNewPools = new Map();
 const riskCache = fs.existsSync(RISK_FILE) ? JSON.parse(fs.readFileSync(RISK_FILE)) : {};
 let lastPinnedId = null;
 let errorCount = 0;
+
+// ---------- STARTUP CHECK ----------
+if (process.version.split('.')[0].slice(1) < 14) {
+  console.error('Node.js version 14 or higher required for full functionality');
+  process.exit(1);
+}
 
 // ---------- HISTORY & RISK CACHE ----------
 const history = fs.existsSync(HISTORY_FILE)
@@ -91,21 +99,27 @@ function getCachedRisk(address) {
 }
 
 // ---------- UTILS ----------
-const fmtUsd = (n) => {
+function fmtUsd(n) {
   const num = Number(n) || 0;
   if (num >= 1_000_000) return `$${(num / 1_000_000).toFixed(2)}M`;
   if (num >= 1_000) return `$${(num / 1_000).toFixed(2)}K`;
   return `$${num.toFixed(2)}`;
-};
+}
 
-const fmtPct = (n) => `${(n >= 0 ? '+' : '')}${n.toFixed(1)}%`;
+function fmtPct(n) {
+  return `${(n >= 0 ? '+' : '')}${n.toFixed(1)}%`;
+}
 
-const esc = (s = '') =>
-  String(s)
-    .replace(/&/g, '&')
-    .replace(//g, '>');
+function esc(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
-const nowMs = () => Date.now();
+function nowMs() {
+  return Date.now();
+}
 
 async function safeFetch(fn, retries = 4) {
   for (let i = 0; i < retries; i++) {
@@ -308,7 +322,6 @@ async function getAIScores(items) {
 
 async function getMarketSummary(items) {
   if (!OPENAI_API_KEY && !CLAUDE_API_KEY && !GROQ_API_KEY) return '';
-  // Use Claude if available for better narrative
   if (CLAUDE_API_KEY) {
     return await aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items, true);
   }
@@ -335,10 +348,10 @@ async function checkNewPools(candidates) {
     const lastAlert = alertedNewPools.get(key) || 0;
     if (nowMs() - lastAlert > Number(NEW_ALERT_COOLDOWN_MIN) * 60000) {
       const feat = buildFeatures(p);
-      const msg = `🆕 New Pool Alert! ${esc(a.name)}\n` +
+      const msg = `🆕 <b>New Pool Alert!</b> ${esc(a.name)}\n` +
                   `💧 LQ: ${fmtUsd(feat.liq_usd)} | 💵 Vol: ${fmtUsd(feat.vol24_now)}\n` +
                   `🛒 Buyers: ${feat.buyers24} | 📈 24h: ${fmtPct(Number(a.price_change_percentage?.h24 || 0))}\n` +
-                  `View on Gecko`;
+                  `<a href="${esc(feat.link)}">View on Gecko</a>`;
       await bot.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
       alertedNewPools.set(key, nowMs());
     }
@@ -359,7 +372,7 @@ function baseHotness(f) {
 
 function computeBurstLabel(f) {
   if (f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT))
-    return `⚡ Vol Burst: +${fmtUsd(f.vol24_delta_5m)} (${fmtPct(f.vol24_delta_rate * 100)})\n`;
+    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${fmtPct(f.vol24_delta_rate * 100)})\n`;
   return '';
 }
 
@@ -370,10 +383,10 @@ function getRiskEmoji(risk) {
 // ---------- TG OUTPUT ----------
 function formatTrending(rows, aiMap, summary) {
   if (!rows.length)
-    return `😴 No trending pools right now\n🕒 Chain is quiet — check back later. Total TXN 24h: ${fmtUsd(0)}`;
+    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later. Total TXN 24h: ${fmtUsd(0)}`;
 
   const lines = [
-    `🔥 BESC HyperChain — AI Alpha Top ${rows.length}`,
+    `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
     `🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 Multi-AI Scored | 📊 Enhanced Analytics\n`,
     `─────────────────`,
   ];
@@ -385,32 +398,32 @@ function formatTrending(rows, aiMap, summary) {
     const ai = aiMap[f.address] || {};
     const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '➡️' : '❓';
     const riskIcon = getRiskEmoji(f.risk_level || ai.risk || 'med');
-    const insightLine = ai.reason ? `💡 ${esc(ai.reason)}\n` : '';
-    const tagsLine = ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '';
-    const predictionLine = ai.prediction ? `${icon} AI Pred (${ai.confidence?.toFixed(0)}% conf): ${esc(ai.prediction.toUpperCase())}\n` : '';
-    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.05 ? '🔥 Momentum Spike\n' : '';
-    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 Fresh Launch\n' : '';
-    const trendLine = f.hist_trend ? `📈 Trend: ${fmtPct(f.hist_trend * 100)} | Volatility: ${f.hist_vola.toFixed(1)}%\n` : '';
+    const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : '';
+    const tagsLine = ai.tags?.length ? `🏷 <i>${esc(ai.tags.join(', '))}</i>\n` : '';
+    const predictionLine = ai.prediction ? `${icon} <b>AI Pred (${ai.confidence?.toFixed(0)}% conf):</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
+    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.05 ? '🔥 <b>Momentum Spike</b>\n' : '';
+    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>Fresh Launch</b>\n' : '';
+    const trendLine = f.hist_trend ? `📈 <b>Trend:</b> ${fmtPct(f.hist_trend * 100)} | Volatility: ${f.hist_vola.toFixed(1)}%\n` : '';
     let pressure = '';
-    if (f.buys24 > f.sells24 * 3) pressure = '🟢 Heavy Buy Pressure\n';
-    else if (f.sells24 > f.buys24 * 3) pressure = '🔴 Heavy Sell Pressure\n';
-    else if (f.buy_sell_ratio > 1.5) pressure = '🟢 Buy Pressure\n';
+    if (f.buys24 > f.sells24 * 3) pressure = '🟢 <b>Heavy Buy Pressure</b>\n';
+    else if (f.sells24 > f.buys24 * 3) pressure = '🔴 <b>Heavy Sell Pressure</b>\n';
+    else if (f.buy_sell_ratio > 1.5) pressure = '🟢 <b>Buy Pressure</b>\n';
     const histLine = f.hist_avg
-      ? `📊 vs Hist Avg: ${fmtPct(f.vol_vs_avg_pct)}\n`
+      ? `📊 <b>vs Hist Avg:</b> ${fmtPct(f.vol_vs_avg_pct)}\n`
       : '';
     lines.push(
-      `${i + 1}️⃣ ${riskIcon} ${esc(a.name)}\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${tagsLine}${predictionLine}` +
-        `💵 Vol: ${fmtUsd(f.vol24_now)} | 💧 LQ: ${fmtUsd(f.liq_usd)}\n` +
-        `🏦 FDV: ${fmtUsd(f.fdv_usd)} | 🤖 Score: ${ai.score?.toFixed(1) || 'N/A'}/100 ${icon}\n` +
-        `📈 24h Chg: ${fmtPct(Number(a.price_change_percentage?.h24 || 0))} | 👥 Buyers: ${f.buyers24}\n` +
-        `${histLine}${trendLine}📊 GeckoTerminal\n` +
+      `${i + 1}️⃣ ${riskIcon} <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${tagsLine}${predictionLine}` +
+        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
+        `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 <b>Score:</b> ${ai.score?.toFixed(1) || 'N/A'}/100 ${icon}\n` +
+        `📈 <b>24h Chg:</b> ${fmtPct(Number(a.price_change_percentage?.h24 || 0))} | 👥 Buyers: ${f.buyers24}\n` +
+        `${histLine}${trendLine}<a href="${esc(f.link)}">📊 GeckoTerminal</a>\n` +
         `─────────────────`
     );
   }
 
-  if (summary) lines.push(`\n📊 🤖 AI Market Insight: ${esc(summary)}`);
+  if (summary) lines.push(`\n📊 <b>🤖 AI Market Insight:</b> <i>${esc(summary)}</i>`);
 
-  lines.push(`\nPowered by Multi-AI Consensus | DYOR 🚨`);
+  lines.push(`\n<i>Powered by Multi-AI Consensus | DYOR 🚨</i>`);
 
   return lines.join('\n');
 }
@@ -466,7 +479,7 @@ async function postTrending() {
       await bot
         .sendMessage(
           TELEGRAM_CHAT_ID,
-          `⚠️ Bot Alert: Fetch error, retrying... (${errorCount}/3)`,
+          `⚠️ <b>Bot Alert:</b> Fetch error, retrying... (${errorCount}/3)`,
           { parse_mode: 'HTML' }
         )
         .catch(() => {});
@@ -474,7 +487,7 @@ async function postTrending() {
       await bot
         .sendMessage(
           TELEGRAM_CHAT_ID,
-          `🚨 Critical: Multiple errors. Check logs. Using last pinned.`,
+          `🚨 <b>Critical:</b> Multiple errors. Check logs. Using last pinned.`,
           { parse_mode: 'HTML' }
         )
         .catch(() => {});
@@ -483,13 +496,13 @@ async function postTrending() {
 }
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
+process.on('SIGINT', () => {
   console.log('Shutting down gracefully...');
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
   fs.writeFileSync(RISK_FILE, JSON.stringify(riskCache, null, 2));
   process.exit(0);
 });
 
-console.log('✅ Elite AI-Powered BESC Trending Bot v8 — Unrivaled Alpha Engine running...');
+console.log('✅ Elite AI-Powered BESC Trending Bot v9 — Unrivaled Alpha Engine running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
