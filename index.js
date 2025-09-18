@@ -25,10 +25,10 @@ const {
   OPENAI_API_KEY,
   AI_MODEL = 'gpt-4o-mini',
   AI_WEIGHT = '1500',
-  AI_TIMEOUT_MS = '25000',
+  AI_TIMEOUT_MS = '60000',  // Increased to 60 seconds to handle longer AI responses
 
   CLAUDE_API_KEY,
-  CLAUDE_MODEL = 'claude-sonnet-4-20250514',
+  CLAUDE_MODEL = 'claude-3-haiku-20240307',
   GROQ_API_KEY,
   GROQ_MODEL = 'llama-3.1-70b-versatile',
 
@@ -39,7 +39,7 @@ const {
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
   throw new Error('Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID');
 
-const bot = new TelegramBot(TELEGRAM_CHAT_ID ? TELEGRAM_TOKEN : '');
+const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const lastVolumes = new Map();
 let lastPinnedId = null;
@@ -157,10 +157,22 @@ function buildFeatures(p) {
 // ---------- AI SCORING ----------
 function cleanJsonString(raw) {
   if (!raw) return '{}';
-  const match = raw.match(/\{[\s\S]*\}/);
-  let json = match ? match[0] : raw;
-  json = json.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
-  return json;
+  try {
+    // Remove any leading non-JSON text
+    let jsonStr = raw.trim();
+    if (!jsonStr.startsWith('{')) {
+      const match = jsonStr.match(/\{[\s\S]*\}/);
+      jsonStr = match ? match[0] : '{ }';
+    }
+    // Remove trailing commas more robustly
+    jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
+    // Parse to validate
+    const parsed = JSON.parse(jsonStr);
+    return JSON.stringify(parsed); // Return canonicalized JSON
+  } catch (e) {
+    console.error(`[cleanJsonString] Invalid JSON: ${e.message}, Raw snippet: ${raw.slice(0, 200)}...`);
+    return '{}';
+  }
 }
 
 async function aiScores(model, endpoint, key, items, isSummary = false) {
@@ -189,10 +201,15 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
 
     const { data } = await axios.post(endpoint, payload, { headers, timeout: Number(AI_TIMEOUT_MS) });
     let raw = endpoint.includes('anthropic') ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
-    raw = cleanJsonString(raw);
-    return isSummary ? raw.trim() : JSON.parse(raw || '{}');
+    if (!raw) {
+      console.error(`[AI/${model}] No response content received`);
+      return {};
+    }
+    console.log(`[AI/${model}] Raw response snippet: ${raw.slice(0, 200)}...`); // Debug log
+    const cleaned = cleanJsonString(raw);
+    return isSummary ? cleaned.trim() : JSON.parse(cleaned);
   } catch (e) {
-    console.error(`[AI/${model}] fail:`, e.message);
+    console.error(`[AI/${model}] fail: ${e.message}`);
     return {};
   }
 }
