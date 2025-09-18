@@ -163,10 +163,14 @@ function buildFeatures(p) {
 }
 
 // ---------- AI SCORING ----------
-function extractJsonString(text) {
-  if (!text) return '{}';
-  const match = text.match(/\{[\s\S]*\}/);
-  return match ? match[0].trim() : '{}';
+function cleanJsonString(raw) {
+  if (!raw) return '{}';
+  // Extract JSON block
+  const match = raw.match(/\{[\s\S]*\}/);
+  let json = match ? match[0] : raw;
+  // Remove trailing commas before } or ]
+  json = json.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
+  return json;
 }
 
 async function aiScores(model, endpoint, key, items, isSummary = false) {
@@ -217,20 +221,9 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
     });
 
     let raw = isClaude ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
-    if (isClaude && !isSummary) raw = extractJsonString(raw);
+    raw = cleanJsonString(raw);
 
-    try {
-      return isSummary ? raw.trim() : JSON.parse(raw || '{}');
-    } catch (err) {
-      console.error(`[AI/${model}] JSON parse fail:`, err.message, 'RAW:', raw);
-      try {
-        const safe = raw.replace(/^[^{]+/, '').replace(/[^}]+$/, '');
-        return JSON.parse(safe);
-      } catch (e2) {
-        console.error(`[AI/${model}] Fallback also failed`);
-        return isSummary ? '' : {};
-      }
-    }
+    return isSummary ? raw.trim() : JSON.parse(raw || '{}');
   } catch (e) {
     console.error(`[AI/${model}] fail:`, e.message);
     return isSummary ? '' : {};
@@ -382,6 +375,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v6 running...');
+console.log('✅ AI-Powered BESC Trending Bot v7 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
