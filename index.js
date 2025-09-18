@@ -282,6 +282,29 @@ function computeBurstLabel(f) {
 }
 
 // ---------- TG OUTPUT ----------
+async function sendTelegramMessages(chatId, text, options) {
+  const maxLength = 4000; // Slightly below Telegram's 4096 limit
+  if (text.length <= maxLength) {
+    return await bot.sendMessage(chatId, text, options);
+  }
+  const messages = [];
+  let currentMessage = '';
+  const lines = text.split('\n');
+  for (const line of lines) {
+    if (currentMessage.length + line.length + 1 > maxLength) {
+      messages.push(currentMessage);
+      currentMessage = '';
+    }
+    currentMessage += line + '\n';
+  }
+  if (currentMessage) messages.push(currentMessage);
+  const sentMessages = [];
+  for (const msg of messages) {
+    sentMessages.push(await bot.sendMessage(chatId, msg, options));
+  }
+  return sentMessages[sentMessages.length - 1]; // Return last message for pinning
+}
+
 function formatTrending(rows, aiMap, summary) {
   if (!rows.length)
     return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
@@ -346,7 +369,7 @@ async function postTrending() {
     const top = scored.slice(0, Number(TRENDING_SIZE));
     const summary = await getMarketSummary(top.map((t) => t.feat));
 
-    const msg = await bot.sendMessage(
+    const msg = await sendTelegramMessages(
       TELEGRAM_CHAT_ID,
       formatTrending(top, aiMap, summary),
       { parse_mode: 'HTML', disable_web_page_preview: true }
