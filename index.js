@@ -1,9 +1,10 @@
 // index.js
-require('dotenv').config();
-const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const fs = require('fs');
-const crypto = require('crypto');
+import { config } from 'dotenv';
+config();
+import TelegramBot from 'node-telegram-bot-api';
+import axios from 'axios';
+import { promises as fs } from 'fs';
+import crypto from 'crypto';
 
 // ---------- ENV ----------
 const {
@@ -50,27 +51,25 @@ const bot = new TelegramBot(TELEGRAM_TOKEN);
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const lastVolumes = new Map();
 const alertedNewPools = new Map();
-const riskCache = fs.existsSync(RISK_FILE) ? JSON.parse(fs.readFileSync(RISK_FILE)) : {};
+const riskCache = (await fs.access(RISK_FILE).then(() => JSON.parse(fs.readFile(RISK_FILE))).catch(() => {})) || {};
 let lastPinnedId = null;
 let errorCount = 0;
 
 // ---------- STARTUP CHECK ----------
 if (process.version.split('.')[0].slice(1) < 14) {
-  console.error('Node.js version 14 or higher required for full functionality');
+  console.error('Node.js version 14 or higher required for ESM support');
   process.exit(1);
 }
 
 // ---------- HISTORY & RISK CACHE ----------
-const history = fs.existsSync(HISTORY_FILE)
-  ? JSON.parse(fs.readFileSync(HISTORY_FILE))
-  : {};
+const history = (await fs.access(HISTORY_FILE).then(() => JSON.parse(fs.readFile(HISTORY_FILE))).catch(() => {})) || {};
 
-function updateHistory(address, vol24) {
+async function updateHistory(address, vol24) {
   if (!history[address]) history[address] = [];
   history[address].push({ t: Date.now(), v: vol24 });
   if (history[address].length > Number(HISTORY_MAX_POINTS))
     history[address].shift();
-  fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+  await fs.writeFile(HISTORY_FILE, JSON.stringify(history, null, 2));
 }
 
 function getHistoryStats(address) {
@@ -83,13 +82,13 @@ function getHistoryStats(address) {
   return { avg, trend, vola: vola * 100 };
 }
 
-function updateRiskCache(address, risk) {
+async function updateRiskCache(address, risk) {
   riskCache[address] = { risk, updated: Date.now() };
   if (Object.keys(riskCache).length > 1000) {
     const keys = Object.keys(riskCache).sort((a, b) => riskCache[b].updated - riskCache[a].updated);
     keys.slice(500).forEach(k => delete riskCache[k]);
   }
-  fs.writeFileSync(RISK_FILE, JSON.stringify(riskCache, null, 2));
+  await fs.writeFile(RISK_FILE, JSON.stringify(riskCache, null, 2));
 }
 
 function getCachedRisk(address) {
@@ -315,7 +314,7 @@ async function getAIScores(items) {
     };
 
     // Cache risk
-    updateRiskCache(addr, modeRisk);
+    await updateRiskCache(addr, modeRisk);
   }
   return merged;
 }
@@ -401,7 +400,7 @@ function formatTrending(rows, aiMap, summary) {
     const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : '';
     const tagsLine = ai.tags?.length ? `🏷 <i>${esc(ai.tags.join(', '))}</i>\n` : '';
     const predictionLine = ai.prediction ? `${icon} <b>AI Pred (${ai.confidence?.toFixed(0)}% conf):</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
-    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.05 ? '🔥 <b>Momentum Spike</b>\n' : '';
+    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.05 ? '🔥 <b>Momentum Spike</b>\n` : '';
     const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>Fresh Launch</b>\n' : '';
     const trendLine = f.hist_trend ? `📈 <b>Trend:</b> ${fmtPct(f.hist_trend * 100)} | Volatility: ${f.hist_vola.toFixed(1)}%\n` : '';
     let pressure = '';
@@ -436,7 +435,7 @@ async function postTrending() {
     const candidates = raw.filter(isGoodPool);
     await checkNewPools(candidates);
     const feats = candidates.map(buildFeatures);
-    for (const f of feats) updateHistory(f.address, f.vol24_now);
+    for (const f of feats) await updateHistory(f.address, f.vol24_now);
 
     const aiMap = await getAIScores(feats);
     const scored = feats
@@ -496,13 +495,13 @@ async function postTrending() {
 }
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
-  fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
-  fs.writeFileSync(RISK_FILE, JSON.stringify(riskCache, null, 2));
+  await fs.writeFile(HISTORY_FILE, JSON.stringify(history, null, 2));
+  await fs.writeFile(RISK_FILE, JSON.stringify(riskCache, null, 2));
   process.exit(0);
 });
 
-console.log('✅ Elite AI-Powered BESC Trending Bot v9 — Unrivaled Alpha Engine running...');
+console.log('✅ Elite AI-Powered BESC Trending Bot v10 — Unrivaled Alpha Engine running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
