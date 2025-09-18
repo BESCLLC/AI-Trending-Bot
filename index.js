@@ -3,7 +3,6 @@ import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import fs from 'fs';
 
-// ---------- ENV ----------
 const {
   TELEGRAM_TOKEN,
   TELEGRAM_CHAT_ID,
@@ -18,10 +17,6 @@ const {
   BURST_MIN_PCT = '1',
 
   NEW_POOL_MAX_MIN = '15',
-  NEW_POOL_MIN_LIQ_USD = '5000',
-  NEW_POOL_MIN_VOL24_USD = '1000',
-  NEW_POOL_MIN_BUYERS = '5',
-  NEW_ALERT_COOLDOWN_MIN = '60',
 
   OPENAI_API_KEY,
   AI_MODEL = 'gpt-4o-mini',
@@ -33,8 +28,6 @@ const {
   GROQ_API_KEY,
   GROQ_MODEL = 'llama-3.1-70b-versatile',
 
-  SPONSORED_POOLS = '',
-
   HISTORY_FILE = './history.json',
   HISTORY_MAX_POINTS = '2016',
 } = process.env;
@@ -45,7 +38,6 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 const GT_BASE = 'https://api.geckoterminal.com/api/v2';
 const lastVolumes = new Map();
-const alertedNewPools = new Map();
 let lastPinnedId = null;
 
 // ---------- HISTORY ----------
@@ -67,7 +59,6 @@ function getHistoryStats(address) {
   return { avg };
 }
 
-// ---------- UTILS ----------
 const fmtUsd = (n) => {
   const num = Number(n) || 0;
   if (num >= 1_000_000) return `$${(num / 1_000_000).toFixed(2)}M`;
@@ -95,7 +86,6 @@ async function safeFetch(fn, retries = 3) {
   throw new Error('All retries failed');
 }
 
-// ---------- FETCH POOLS ----------
 async function fetchPoolsPage(page = 1) {
   const url = `${GT_BASE}/networks/besc-hyperchain/pools`;
   const { data } = await axios.get(url, {
@@ -106,10 +96,7 @@ async function fetchPoolsPage(page = 1) {
 }
 
 async function fetchAllPools() {
-  const [p1, p2] = await Promise.allSettled([
-    fetchPoolsPage(1),
-    fetchPoolsPage(2),
-  ]);
+  const [p1, p2] = await Promise.allSettled([fetchPoolsPage(1), fetchPoolsPage(2)]);
   const arr = [];
   if (p1.status === 'fulfilled') arr.push(...p1.value);
   if (p2.status === 'fulfilled') arr.push(...p2.value);
@@ -130,34 +117,22 @@ function buildFeatures(p) {
   const volNow = Number(a.volume_usd?.h24 || 0);
   const volPrev = Number(lastVolumes.get(a.address) || volNow);
   const delta = volNow - volPrev;
-  const rate = volPrev > 0 ? delta / volPrev : 0;
   const liq = Number(a.reserve_in_usd || 0);
   const fdv = Number(a.market_cap_usd || a.fdv_usd || 0);
-  const change = Number(a.price_change_percentage?.h24 || 0);
   const buys = Number(a.transactions?.h24?.buys || 0);
   const sells = Number(a.transactions?.h24?.sells || 0);
-  const buyers = Number(a.transactions?.h24?.buyers || 0);
-  const bsr = (buys + 1) / (sells + 1);
-  const ageMin = (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
   const histStats = getHistoryStats(a.address);
   return {
     address: a.address,
     name: a.name,
     liq_usd: liq,
     fdv_usd: fdv,
-    age_min: ageMin,
     vol24_now: volNow,
     vol24_delta_5m: delta,
-    vol24_delta_rate: rate,
-    change24_abs: Math.abs(change),
-    buy_sell_ratio: bsr,
-    buyers24: buyers,
     buys24: buys,
     sells24: sells,
     hist_avg: histStats.avg,
-    vol_vs_avg_pct: histStats.avg
-      ? ((volNow - histStats.avg) / histStats.avg) * 100
-      : 0,
+    vol_vs_avg_pct: histStats.avg ? ((volNow - histStats.avg) / histStats.avg) * 100 : 0,
     link: `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`,
   };
 }
@@ -165,73 +140,46 @@ function buildFeatures(p) {
 // ---------- AI SCORING ----------
 function cleanJsonString(raw) {
   if (!raw) return '{}';
-  // Extract JSON block
   const match = raw.match(/\{[\s\S]*\}/);
-  let json = match ? match[0] : raw;
-  // Remove trailing commas before } or ]
-  json = json.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
-  return json;
+  return match ? match[0].replace(/,\s*}/g, '}').replace(/,\s*]/g, ']') : '{}';
 }
 
-async function aiScores(model, endpoint, key, items, isSummary = false) {
+async function aiScores(model, endpoint, key, items) {
   try {
-    const isClaude = endpoint.includes('anthropic');
-    const payload = isClaude
+    const payload = endpoint.includes('anthropic')
       ? {
           model,
-          max_tokens: isSummary ? 300 : 1024,
-          messages: [
-            {
-              role: 'user',
-              content: isSummary
-                ? `Give me a 1-2 sentence market summary and price direction for these pools: ${JSON.stringify(items)}`
-                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
-            },
-          ],
+          max_tokens: 1024,
+          messages: [{
+            role: 'user',
+            content: `Return ONLY valid JSON. For each pool return {"score":0-100,"risk":"low|med|high","reason":"<15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`
+          }],
         }
       : {
           model,
           temperature: 0.2,
-          response_format: isSummary ? undefined : { type: 'json_object' },
+          response_format: { type: 'json_object' },
           messages: [
-            {
-              role: 'system',
-              content: isSummary
-                ? 'You are a crypto market analyst. Summarize market and give a price trend outlook.'
-                : 'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score,risk,tags,reason,prediction}.',
-            },
+            { role: 'system', content: 'Return valid JSON only, no text outside JSON.' },
             { role: 'user', content: JSON.stringify(items) },
           ],
         };
+    const headers = endpoint.includes('anthropic')
+      ? { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+      : { Authorization: `Bearer ${key}`, 'content-type': 'application/json' };
 
-    const headers = isClaude
-      ? {
-          'x-api-key': key,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
-        }
-      : {
-          Authorization: `Bearer ${key}`,
-          'content-type': 'application/json',
-        };
-
-    const { data } = await axios.post(endpoint, payload, {
-      headers,
-      timeout: Number(AI_TIMEOUT_MS),
-    });
-
-    let raw = isClaude ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
+    const { data } = await axios.post(endpoint, payload, { headers, timeout: Number(AI_TIMEOUT_MS) });
+    let raw = endpoint.includes('anthropic') ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
     raw = cleanJsonString(raw);
-
-    return isSummary ? raw.trim() : JSON.parse(raw || '{}');
+    return JSON.parse(raw || '{}');
   } catch (e) {
     console.error(`[AI/${model}] fail:`, e.message);
-    return isSummary ? '' : {};
+    return {};
   }
 }
 
 async function getAIScores(items) {
-  const [openai, claude, groq] = await Promise.allSettled([
+  const results = await Promise.allSettled([
     OPENAI_API_KEY ? aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items) : {},
     CLAUDE_API_KEY ? aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items) : {},
     GROQ_API_KEY ? aiScores(GROQ_MODEL, 'https://api.groq.com/openai/v1/chat/completions', GROQ_API_KEY, items) : {},
@@ -240,89 +188,44 @@ async function getAIScores(items) {
   const merged = {};
   for (const it of items) {
     const addr = it.address;
-    const scores = [
-      openai.value?.[addr]?.score,
-      claude.value?.[addr]?.score,
-      groq.value?.[addr]?.score,
-    ].filter((x) => typeof x === 'number');
-
-    if (!scores.length) continue;
-
-    const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+    const vals = results.map(r => r.value?.[addr]).filter(Boolean);
+    const scores = vals.map(v => v.score).filter(n => typeof n === 'number');
+    const avg = scores.length ? scores.reduce((a,b)=>a+b,0)/scores.length : 50;
     merged[addr] = {
       score: avg,
-      risk: openai.value?.[addr]?.risk || claude.value?.[addr]?.risk || 'med',
-      tags: openai.value?.[addr]?.tags || claude.value?.[addr]?.tags || [],
-      reason: openai.value?.[addr]?.reason || claude.value?.[addr]?.reason || '',
-      prediction: openai.value?.[addr]?.prediction || claude.value?.[addr]?.prediction || '',
-      disagree: Math.max(...scores) - Math.min(...scores) > 30,
+      risk: vals.find(v => v.risk)?.risk || 'med',
+      reason: vals.find(v => v.reason)?.reason || '',
+      prediction: vals.find(v => v.prediction)?.prediction || '',
     };
   }
   return merged;
 }
 
-async function getMarketSummary(items) {
-  if (!OPENAI_API_KEY) return '';
-  return await aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items, true);
-}
-
-// ---------- RANKING ----------
-function baseHotness(f) {
-  const burstBoost = Math.max(0, f.vol24_delta_5m) * 2;
-  const buyerBoost = (f.buyers24 || 0) * 50;
-  const recencyBonus = f.age_min < 360 ? 500 : 0;
-  const sellPenalty = f.buy_sell_ratio < 0.5 ? f.vol24_now * 0.1 : 0;
-  return f.vol24_now + burstBoost + buyerBoost + recencyBonus - sellPenalty;
-}
-
-function computeBurstLabel(f) {
-  if (f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT))
-    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
-  return '';
-}
-
-// ---------- TG OUTPUT ----------
-function formatTrending(rows, aiMap, summary) {
-  if (!rows.length)
-    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
-
-  const lines = [
-    `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
-    `🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`,
-  ];
+// ---------- OUTPUT ----------
+function formatTrending(rows, aiMap) {
+  const header = `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>\n🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`;
+  const chunks = [];
+  let current = header;
 
   for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    const a = r.pool.attributes;
-    const f = r.feat;
+    const r = rows[i]; const a = r.pool.attributes; const f = r.feat;
     const ai = aiMap[f.address] || {};
-    const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '⚠️' : '';
-    const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
-    const predictionLine = ai.prediction ? `${icon} <b>AI Prediction:</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
-    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
-    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
-    let pressure = '';
-    if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
-    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
-    const histLine = f.hist_avg
-      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
-      : '';
-    lines.push(
-      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
-        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
-        `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
-          a.price_change_percentage?.h24 || 0
-        ).toFixed(2)}%\n` +
-        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
-    );
+    const block =
+      `${i+1}️⃣ <b>${esc(a.name)}</b>\n` +
+      `💵 Vol: ${fmtUsd(f.vol24_now)} | 💧 LQ: ${fmtUsd(f.liq_usd)} | 🛒 Buys: ${f.buys24}/Sells: ${f.sells24}\n` +
+      `🏦 FDV: ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || 50}/100 | ${ai.prediction ? `📈 ${ai.prediction.toUpperCase()}` : ''}\n` +
+      `${ai.reason ? `💡 ${esc(ai.reason)}\n` : ''}<a href="${esc(f.link)}">📊 View</a>\n\n`;
+
+    if ((current + block).length > 3800) { // prevent Telegram 4096 limit
+      chunks.push(current);
+      current = '';
+    }
+    current += block;
   }
-
-  if (summary) lines.push(`\n📊 <b>AI Market Take:</b> <i>${esc(summary)}</i>`);
-
-  return lines.join('\n');
+  if (current) chunks.push(current);
+  return chunks;
 }
 
-// ---------- MAIN ----------
 async function postTrending() {
   try {
     const raw = await safeFetch(fetchAllPools);
@@ -332,49 +235,36 @@ async function postTrending() {
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
 
     const aiMap = await getAIScores(feats);
-    const scored = feats
-      .map((f) => {
-        const aiScore = aiMap[f.address]?.score || 0;
-        return {
-          feat: f,
-          pool: candidates.find((p) => p.attributes.address === f.address),
-          final: baseHotness(f) + aiScore * Number(AI_WEIGHT),
-        };
-      })
-      .sort((a, b) => b.final - a.final);
+    const scored = feats.map(f => ({
+      feat: f,
+      pool: candidates.find(p => p.attributes.address === f.address),
+      final: f.vol24_now + (aiMap[f.address]?.score || 50) * Number(AI_WEIGHT),
+    })).sort((a,b) => b.final - a.final);
 
     const top = scored.slice(0, Number(TRENDING_SIZE));
-    const summary = await getMarketSummary(top.map((t) => t.feat));
+    const chunks = formatTrending(top, aiMap);
 
-    const msg = await bot.sendMessage(
-      TELEGRAM_CHAT_ID,
-      formatTrending(top, aiMap, summary),
-      { parse_mode: 'HTML', disable_web_page_preview: true }
-    );
-
+    // send first chunk & pin
+    const msg = await bot.sendMessage(TELEGRAM_CHAT_ID, chunks[0], { parse_mode: 'HTML', disable_web_page_preview: true });
     if (lastPinnedId) {
-      await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(() => {});
-      await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(() => {});
+      await bot.unpinAllChatMessages(TELEGRAM_CHAT_ID).catch(()=>{});
+      await bot.deleteMessage(TELEGRAM_CHAT_ID, lastPinnedId).catch(()=>{});
     }
-    await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, {
-      disable_notification: true,
-    });
+    await bot.pinChatMessage(TELEGRAM_CHAT_ID, msg.message_id, { disable_notification: true });
     lastPinnedId = msg.message_id;
+
+    // send any remaining chunks
+    for (let i = 1; i < chunks.length; i++) {
+      await bot.sendMessage(TELEGRAM_CHAT_ID, chunks[i], { parse_mode: 'HTML', disable_web_page_preview: true });
+    }
 
     for (const c of candidates)
       lastVolumes.set(c.attributes.address, Number(c.attributes.volume_usd?.h24 || 0));
   } catch (e) {
     console.error('[TrendingBot] Fail:', e.message);
-    await bot
-      .sendMessage(
-        TELEGRAM_CHAT_ID,
-        `⚠️ <b>Trending Bot Alert:</b> API unavailable. Using last pinned snapshot.`,
-        { parse_mode: 'HTML' }
-      )
-      .catch(() => {});
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v7 running...');
+console.log('✅ AI-Powered BESC Trending Bot v10 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
