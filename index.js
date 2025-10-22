@@ -218,7 +218,7 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
       : {
           model,
           temperature: 0.2,
-          response_format: { type: 'json_object' },  // Re-enabled for strict JSON
+          response_format: isSummary ? undefined : { type: 'json_object' }, // Only use for non-summary
           max_tokens: isSummary ? 300 : 1024,
           messages: [
             {
@@ -229,7 +229,9 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             },
             {
               role: 'user',
-              content: JSON.stringify(items),
+              content: isSummary
+                ? `Summarize trends and price outlook for these pools: ${JSON.stringify(items)}`
+                : `Output JSON for analysis of these pools: ${JSON.stringify(items)}`,
             },
           ],
         };
@@ -417,6 +419,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v8.3 running...');
+console.log('✅ AI-Powered BESC Trending Bot v8.4 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
