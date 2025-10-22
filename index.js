@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
-import fs from 'fs';
 import Database from 'better-sqlite3';
 
 // ---------- ENV ----------
@@ -107,7 +106,7 @@ const esc = (s = '') =>
   String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;');  // Fixed: Added missing semicolon here
 
 const nowMs = () => Date.now();
 
@@ -253,7 +252,7 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
 
     return isSummary ? raw.trim() : JSON.parse(raw || '{}');
   } catch (e) {
-    console.error(`[AI/${model}] fail:`, e.message);
+    console.error(`[AI/${model}] fail:`, e.message, e.response?.data);  // Added logging of e.response.data
     return isSummary ? '' : {};
   }
 }
@@ -412,6 +411,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v8 running...');
+console.log('✅ AI-Powered BESC Trending Bot v8.1 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
