@@ -2,6 +2,7 @@ import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import fs from 'fs';
+import Database from 'better-sqlite3';
 
 // ---------- ENV ----------
 const {
@@ -29,14 +30,15 @@ const {
   AI_TIMEOUT_MS = '15000',
 
   CLAUDE_API_KEY,
-  CLAUDE_MODEL = 'claude-sonnet-4-20250514',
+  CLAUDE_MODEL = 'claude-3-5-sonnet-20240620',  // Fixed to latest Claude model
   GROQ_API_KEY,
   GROQ_MODEL = 'llama-3.1-70b-versatile',
 
-  SPONSORED_POOLS = '',
+  SPONSORED_POOLS = '',  // TODO: Use this to highlight sponsored
 
-  HISTORY_FILE = './history.json',
+  HISTORY_DB = './history.db',
   HISTORY_MAX_POINTS = '2016',
+  HISTORY_DAYS_FOR_AVG = '7',  // New: Use last 7 days for avg
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
@@ -48,23 +50,42 @@ const lastVolumes = new Map();
 const alertedNewPools = new Map();
 let lastPinnedId = null;
 
-// ---------- HISTORY ----------
-const history = fs.existsSync(HISTORY_FILE)
-  ? JSON.parse(fs.readFileSync(HISTORY_FILE))
-  : {};
+// ---------- HISTORY (SQLite) ----------
+const db = new Database(HISTORY_DB);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS history (
+    address TEXT,
+    timestamp INTEGER,
+    volume REAL,
+    PRIMARY KEY (address, timestamp)
+  )
+`);
 
 function updateHistory(address, vol24) {
-  if (!history[address]) history[address] = [];
-  history[address].push({ t: Date.now(), v: vol24 });
-  if (history[address].length > Number(HISTORY_MAX_POINTS))
-    history[address].shift();
+  const stmt = db.prepare('INSERT OR REPLACE INTO history (address, timestamp, volume) VALUES (?, ?, ?)');
+  stmt.run(address, Date.now(), vol24);
+
+  // Prune old data per address to keep under max points
+  const countStmt = db.prepare('SELECT COUNT(*) as count FROM history WHERE address = ?');
+  if (countStmt.get(address).count > Number(HISTORY_MAX_POINTS)) {
+    const deleteStmt = db.prepare(`
+      DELETE FROM history WHERE address = ? AND timestamp = (
+        SELECT timestamp FROM history WHERE address = ? ORDER BY timestamp ASC LIMIT 1
+      )
+    `);
+    deleteStmt.run(address, address);
+  }
 }
 
 function getHistoryStats(address) {
-  const arr = history[address] || [];
-  if (!arr.length) return { avg: 0 };
-  const avg = arr.reduce((a, b) => a + b.v, 0) / arr.length;
-  return { avg };
+  const cutoff = Date.now() - Number(HISTORY_DAYS_FOR_AVG) * 24 * 60 * 60 * 1000;
+  const stmt = db.prepare(`
+    SELECT AVG(volume) as avg
+    FROM history
+    WHERE address = ? AND timestamp > ?
+  `);
+  const row = stmt.get(address, cutoff);
+  return { avg: row.avg || 0 };
 }
 
 // ---------- UTILS ----------
@@ -75,11 +96,17 @@ const fmtUsd = (n) => {
   return `$${num.toFixed(2)}`;
 };
 
+const fmtPrice = (n) => {
+  const num = Number(n);
+  if (num === 0) return '$0';
+  if (num < 0.000001) return `$${num.toExponential(2)}`;
+  return `$${num.toFixed(8).replace(/\.?0+$/, '')}`;
+};
+
 const esc = (s = '') =>
   String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/&/g, '&')
+    .replace(//g, '>');
 
 const nowMs = () => Date.now();
 
@@ -140,6 +167,7 @@ function buildFeatures(p) {
   const bsr = (buys + 1) / (sells + 1);
   const ageMin = (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
   const histStats = getHistoryStats(a.address);
+  const priceUsd = Number(a.base_token_price_usd || 0);  // New: Assume base token price
   return {
     address: a.address,
     name: a.name,
@@ -158,6 +186,7 @@ function buildFeatures(p) {
     vol_vs_avg_pct: histStats.avg
       ? ((volNow - histStats.avg) / histStats.avg) * 100
       : 0,
+    price_usd: priceUsd,  // New
     link: `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`,
   };
 }
@@ -165,10 +194,8 @@ function buildFeatures(p) {
 // ---------- AI SCORING ----------
 function cleanJsonString(raw) {
   if (!raw) return '{}';
-  // Extract JSON block
   const match = raw.match(/\{[\s\S]*\}/);
   let json = match ? match[0] : raw;
-  // Remove trailing commas before } or ]
   json = json.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
   return json;
 }
@@ -184,8 +211,8 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             {
               role: 'user',
               content: isSummary
-                ? `Give me a sentence of the market summary and price direction for these pools: ${JSON.stringify(items)}`
-                : `Return ONLY valid JSON. Map each pool address to {"score":0-100,"risk":"low|med|high","tags":["..."],"reason":"short insight <15 words","prediction":"bullish|bearish|sideways"}. Pools: ${JSON.stringify(items)}`,
+                ? `As a crypto analyst, provide a concise market summary (1-2 sentences) and price direction outlook (bullish/bearish/sideways) based on on-chain metrics for these pools: ${JSON.stringify(items)}`
+                : `Return ONLY valid JSON. For each pool address, output {"score":0-100 (momentum score based on volume, buyers, age, bursts),"risk":"low|med|high (consider buy/sell ratio, history deviation)","tags":["array of 1-3 tags like pump, rug-risk, steady"],"reason":"<15 word insight on momentum/risk","prediction":"bullish|bearish|sideways (based on change, volume trends)"}. Analyze: ${JSON.stringify(items)}`,
             },
           ],
         }
@@ -197,8 +224,8 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
             {
               role: 'system',
               content: isSummary
-                ? 'You are a crypto market analyst. Summarize market and give a price trend outlook.'
-                : 'You are an on-chain momentum analyst. Return JSON mapping each pool address to {score,risk,tags,reason,prediction}.',
+                ? 'You are a crypto market analyst. Summarize key trends and give a price outlook based on volume, liquidity, and changes.'
+                : 'You are an on-chain momentum analyst. Score pools on momentum, risk, and predict direction using provided metrics like volume delta, buy/sell ratio, history avg.',
             },
             { role: 'user', content: JSON.stringify(items) },
           ],
@@ -277,17 +304,17 @@ function baseHotness(f) {
 
 function computeBurstLabel(f) {
   if (f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT))
-    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
+    return `⚡ Vol Burst: +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
   return '';
 }
 
 // ---------- TG OUTPUT ----------
 function formatTrending(rows, aiMap, summary) {
   if (!rows.length)
-    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
+    return `😴 No trending pools right now\n🕒 Chain is quiet — check back later.`;
 
   const lines = [
-    `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
+    `🔥 BESC HyperChain — AI Alpha Top ${rows.length}`,
     `🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`,
   ];
 
@@ -297,35 +324,35 @@ function formatTrending(rows, aiMap, summary) {
     const f = r.feat;
     const ai = aiMap[f.address] || {};
     const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '⚠️' : '';
-    const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
-    const predictionLine = ai.prediction ? `${icon} <b>AI Prediction:</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
-    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
-    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
+    const insightLine = ai.reason ? `💡 ${esc(ai.reason)}\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
+    const predictionLine = ai.prediction ? `${icon} AI Prediction: ${esc(ai.prediction.toUpperCase())}\n` : '';
+    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 Momentum Spike\n' : '';
+    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 New Pool\n' : '';
     let pressure = '';
-    if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
-    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
+    if (f.buys24 > f.sells24 * 2) pressure = '🟢 Strong Buy Pressure\n';
+    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 Heavy Sell Pressure\n';
     const histLine = f.hist_avg
-      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
+      ? `📊 vs 7d Avg: ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
       : '';
     lines.push(
-      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
-        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
-        `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
+      `${i + 1}️⃣ ${esc(a.name)}\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
+        `💰 Price: ${fmtPrice(f.price_usd)}\n` +  // New: Price display
+        `💵 Vol: ${fmtUsd(f.vol24_now)} | 💧 LQ: ${fmtUsd(f.liq_usd)}\n` +
+        `🏦 FDV: ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
           a.price_change_percentage?.h24 || 0
         ).toFixed(2)}%\n` +
-        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
+        `${histLine}📊 View on GeckoTerminal\n`
     );
   }
 
   if (summary) {
-    lines.push(`\n📊 <b>AI Market Take:</b>`);
-    // Only include the Price Trend Outlook section
+    lines.push(`\n📊 AI Market Take:`);
     const summaryLines = summary.split('\n');
     const outlookIndex = summaryLines.findIndex(line => line.includes('Price Trend Outlook'));
     if (outlookIndex !== -1) {
-      lines.push(...summaryLines.slice(outlookIndex).map(line => `<i>${esc(line)}</i>`));
+      lines.push(...summaryLines.slice(outlookIndex).map(line => `${esc(line)}`));
     } else {
-      lines.push(`<i>${esc(summary)}</i>`);
+      lines.push(`${esc(summary)}`);
     }
   }
 
@@ -339,7 +366,6 @@ async function postTrending() {
     const candidates = raw.filter(isGoodPool);
     const feats = candidates.map(buildFeatures);
     for (const f of feats) updateHistory(f.address, f.vol24_now);
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
 
     const aiMap = await getAIScores(feats);
     const scored = feats
@@ -378,13 +404,13 @@ async function postTrending() {
     await bot
       .sendMessage(
         TELEGRAM_CHAT_ID,
-        `⚠️ <b>Trending Bot Alert:</b> API unavailable. Using last pinned snapshot.`,
+        `⚠️ Trending Bot Alert: API unavailable. Using last pinned snapshot.`,
         { parse_mode: 'HTML' }
       )
       .catch(() => {});
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v7 running...');
+console.log('✅ AI-Powered BESC Trending Bot v8 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
