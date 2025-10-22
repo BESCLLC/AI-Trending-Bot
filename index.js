@@ -29,15 +29,15 @@ const {
   AI_TIMEOUT_MS = '15000',
 
   CLAUDE_API_KEY,
-  CLAUDE_MODEL = 'claude-3-5-sonnet-20240620',  // Fixed to latest Claude model
+  CLAUDE_MODEL = 'claude-3-5-sonnet-20240620',
   GROQ_API_KEY,
   GROQ_MODEL = 'llama-3.1-70b-versatile',
 
-  SPONSORED_POOLS = '',  // TODO: Use this to highlight sponsored
+  SPONSORED_POOLS = '',
 
   HISTORY_DB = './history.db',
   HISTORY_MAX_POINTS = '2016',
-  HISTORY_DAYS_FOR_AVG = '7',  // New: Use last 7 days for avg
+  HISTORY_DAYS_FOR_AVG = '7',
 } = process.env;
 
 if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID)
@@ -64,7 +64,6 @@ function updateHistory(address, vol24) {
   const stmt = db.prepare('INSERT OR REPLACE INTO history (address, timestamp, volume) VALUES (?, ?, ?)');
   stmt.run(address, Date.now(), vol24);
 
-  // Prune old data per address to keep under max points
   const countStmt = db.prepare('SELECT COUNT(*) as count FROM history WHERE address = ?');
   if (countStmt.get(address).count > Number(HISTORY_MAX_POINTS)) {
     const deleteStmt = db.prepare(`
@@ -106,7 +105,7 @@ const esc = (s = '') =>
   String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');  // Fixed: Added missing semicolon here
+    .replace(/>/g, '&gt;');
 
 const nowMs = () => Date.now();
 
@@ -167,7 +166,7 @@ function buildFeatures(p) {
   const bsr = (buys + 1) / (sells + 1);
   const ageMin = (nowMs() - new Date(a.pool_created_at).getTime()) / 60000;
   const histStats = getHistoryStats(a.address);
-  const priceUsd = Number(a.base_token_price_usd || 0);  // New: Assume base token price
+  const priceUsd = Number(a.base_token_price_usd || 0);
   return {
     address: a.address,
     name: a.name,
@@ -186,7 +185,7 @@ function buildFeatures(p) {
     vol_vs_avg_pct: histStats.avg
       ? ((volNow - histStats.avg) / histStats.avg) * 100
       : 0,
-    price_usd: priceUsd,  // New
+    price_usd: priceUsd,
     link: `https://www.geckoterminal.com/besc-hyperchain/pools/${a.address}`,
   };
 }
@@ -219,15 +218,19 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
       : {
           model,
           temperature: 0.2,
-          response_format: isSummary ? undefined : { type: 'json_object' },
+          response_format: { type: 'json_object' },  // Re-enabled for strict JSON
+          max_tokens: isSummary ? 300 : 1024,
           messages: [
             {
               role: 'system',
               content: isSummary
                 ? 'You are a crypto market analyst. Summarize key trends and give a price outlook based on volume, liquidity, and changes.'
-                : 'You are an on-chain momentum analyst. Score pools on momentum, risk, and predict direction using provided metrics like volume delta, buy/sell ratio, history avg.',
+                : 'You are an on-chain momentum analyst. Output ONLY valid JSON mapping each pool address to {score: 0-100 (momentum), risk: low|med|high, tags: [1-3 tags], reason: <15 word insight, prediction: bullish|bearish|sideways}. Use metrics like volume delta, buy/sell ratio, history avg.',
             },
-            { role: 'user', content: JSON.stringify(items) },
+            {
+              role: 'user',
+              content: JSON.stringify(items),
+            },
           ],
         };
 
@@ -242,26 +245,29 @@ async function aiScores(model, endpoint, key, items, isSummary = false) {
           'content-type': 'application/json',
         };
 
+    console.log(`[AI/${model}] Sending payload:`, JSON.stringify(payload, null, 2)); // Debug log
+
     const { data } = await axios.post(endpoint, payload, {
       headers,
       timeout: Number(AI_TIMEOUT_MS),
     });
 
     let raw = isClaude ? data.content?.[0]?.text : data.choices?.[0]?.message?.content;
+    console.log(`[AI/${model}] Raw response:`, raw); // Debug log
     raw = cleanJsonString(raw);
 
     return isSummary ? raw.trim() : JSON.parse(raw || '{}');
   } catch (e) {
-    console.error(`[AI/${model}] fail:`, e.message, e.response?.data);  // Added logging of e.response.data
+    console.error(`[AI/${model}] fail:`, e.message, e.response?.data || ''); // Enhanced error logging
     return isSummary ? '' : {};
   }
 }
 
 async function getAIScores(items) {
   const [openai, claude, groq] = await Promise.allSettled([
-    OPENAI_API_KEY ? aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items) : {},
-    CLAUDE_API_KEY ? aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items) : {},
-    GROQ_API_KEY ? aiScores(GROQ_MODEL, 'https://api.groq.com/openai/v1/chat/completions', GROQ_API_KEY, items) : {},
+    OPENAI_API_KEY ? aiScores(AI_MODEL, 'https://api.openai.com/v1/chat/completions', OPENAI_API_KEY, items) : Promise.resolve({}),
+    CLAUDE_API_KEY ? aiScores(CLAUDE_MODEL, 'https://api.anthropic.com/v1/messages', CLAUDE_API_KEY, items) : Promise.resolve({}),
+    GROQ_API_KEY ? aiScores(GROQ_MODEL, 'https://api.groq.com/openai/v1/chat/completions', GROQ_API_KEY, items) : Promise.resolve({}),
   ]);
 
   const merged = {};
@@ -336,7 +342,7 @@ function formatTrending(rows, aiMap, summary) {
       : '';
     lines.push(
       `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
-        `💰 <b>Price:</b> ${fmtPrice(f.price_usd)}\n` +  // New: Price display
+        `💰 <b>Price:</b> ${fmtPrice(f.price_usd)}\n` +
         `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
         `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
           a.price_change_percentage?.h24 || 0
@@ -411,6 +417,6 @@ async function postTrending() {
   }
 }
 
-console.log('✅ AI-Powered BESC Trending Bot v8.1 running...');
+console.log('✅ AI-Powered BESC Trending Bot v8.3 running...');
 setInterval(postTrending, Number(POLL_INTERVAL_MINUTES) * 60 * 1000);
 postTrending();
