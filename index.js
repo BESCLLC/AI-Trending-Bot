@@ -105,8 +105,9 @@ const fmtPrice = (n) => {
 
 const esc = (s = '') =>
   String(s)
-    .replace(/&/g, '&')
-    .replace(//g, '>');
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 
 const nowMs = () => Date.now();
 
@@ -304,17 +305,17 @@ function baseHotness(f) {
 
 function computeBurstLabel(f) {
   if (f.vol24_delta_5m >= Number(BURST_MIN_ABS_USD) && f.vol24_delta_rate * 100 >= Number(BURST_MIN_PCT))
-    return `⚡ Vol Burst: +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
+    return `⚡ <b>Vol Burst:</b> +${fmtUsd(f.vol24_delta_5m)} (${(f.vol24_delta_rate * 100).toFixed(1)}%)\n`;
   return '';
 }
 
 // ---------- TG OUTPUT ----------
 function formatTrending(rows, aiMap, summary) {
   if (!rows.length)
-    return `😴 No trending pools right now\n🕒 Chain is quiet — check back later.`;
+    return `😴 <b>No trending pools right now</b>\n🕒 Chain is quiet — check back later.`;
 
   const lines = [
-    `🔥 BESC HyperChain — AI Alpha Top ${rows.length}`,
+    `🔥 <b>BESC HyperChain — AI Alpha Top ${rows.length}</b>`,
     `🕒 Last ${POLL_INTERVAL_MINUTES} min | 🚀 Movers First | 🤖 AI-Scored\n`,
   ];
 
@@ -324,35 +325,35 @@ function formatTrending(rows, aiMap, summary) {
     const f = r.feat;
     const ai = aiMap[f.address] || {};
     const icon = ai.prediction === 'bullish' ? '📈' : ai.prediction === 'bearish' ? '🔻' : ai.prediction === 'sideways' ? '⚠️' : '';
-    const insightLine = ai.reason ? `💡 ${esc(ai.reason)}\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
-    const predictionLine = ai.prediction ? `${icon} AI Prediction: ${esc(ai.prediction.toUpperCase())}\n` : '';
-    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 Momentum Spike\n' : '';
-    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 New Pool\n' : '';
+    const insightLine = ai.reason ? `💡 <i>${esc(ai.reason)}</i>\n` : (ai.tags?.length ? `🏷 ${esc(ai.tags.join(', '))}\n` : '');
+    const predictionLine = ai.prediction ? `${icon} <b>AI Prediction:</b> ${esc(ai.prediction.toUpperCase())}\n` : '';
+    const momentumLine = f.vol24_delta_5m > (f.hist_avg || 0) * 0.02 ? '🔥 <b>Momentum Spike</b>\n' : '';
+    const newPoolLine = f.age_min < Number(NEW_POOL_MAX_MIN) ? '🆕 <b>New Pool</b>\n' : '';
     let pressure = '';
-    if (f.buys24 > f.sells24 * 2) pressure = '🟢 Strong Buy Pressure\n';
-    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 Heavy Sell Pressure\n';
+    if (f.buys24 > f.sells24 * 2) pressure = '🟢 <b>Strong Buy Pressure</b>\n';
+    else if (f.sells24 > f.buys24 * 2) pressure = '🔻 <b>Heavy Sell Pressure</b>\n';
     const histLine = f.hist_avg
-      ? `📊 vs 7d Avg: ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
+      ? `📊 <b>vs 7d Avg:</b> ${(f.vol_vs_avg_pct >= 0 ? '+' : '')}${f.vol_vs_avg_pct.toFixed(1)}%\n`
       : '';
     lines.push(
-      `${i + 1}️⃣ ${esc(a.name)}\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
-        `💰 Price: ${fmtPrice(f.price_usd)}\n` +  // New: Price display
-        `💵 Vol: ${fmtUsd(f.vol24_now)} | 💧 LQ: ${fmtUsd(f.liq_usd)}\n` +
-        `🏦 FDV: ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
+      `${i + 1}️⃣ <b>${esc(a.name)}</b>\n${momentumLine}${newPoolLine}${computeBurstLabel(f)}${pressure}${insightLine}${predictionLine}` +
+        `💰 <b>Price:</b> ${fmtPrice(f.price_usd)}\n` +  // New: Price display
+        `💵 <b>Vol:</b> ${fmtUsd(f.vol24_now)} | 💧 <b>LQ:</b> ${fmtUsd(f.liq_usd)}\n` +
+        `🏦 <b>FDV:</b> ${fmtUsd(f.fdv_usd)} | 🤖 ${ai.score?.toFixed(1) || '0'}/100 | 📈 24h: ${Number(
           a.price_change_percentage?.h24 || 0
         ).toFixed(2)}%\n` +
-        `${histLine}📊 View on GeckoTerminal\n`
+        `${histLine}<a href="${esc(f.link)}">📊 View on GeckoTerminal</a>\n`
     );
   }
 
   if (summary) {
-    lines.push(`\n📊 AI Market Take:`);
+    lines.push(`\n📊 <b>AI Market Take:</b>`);
     const summaryLines = summary.split('\n');
     const outlookIndex = summaryLines.findIndex(line => line.includes('Price Trend Outlook'));
     if (outlookIndex !== -1) {
-      lines.push(...summaryLines.slice(outlookIndex).map(line => `${esc(line)}`));
+      lines.push(...summaryLines.slice(outlookIndex).map(line => `<i>${esc(line)}</i>`));
     } else {
-      lines.push(`${esc(summary)}`);
+      lines.push(`<i>${esc(summary)}</i>`);
     }
   }
 
@@ -404,7 +405,7 @@ async function postTrending() {
     await bot
       .sendMessage(
         TELEGRAM_CHAT_ID,
-        `⚠️ Trending Bot Alert: API unavailable. Using last pinned snapshot.`,
+        `⚠️ <b>Trending Bot Alert:</b> API unavailable. Using last pinned snapshot.`,
         { parse_mode: 'HTML' }
       )
       .catch(() => {});
